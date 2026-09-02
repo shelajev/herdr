@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use super::{terminal_targets::TerminalTargetError, App};
-use crate::api::schema::AgentStartParams;
+use crate::api::schema::{AgentStartParams, AgentStartSbxParams};
 
 const DEFAULT_AGENT_START_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_AGENT_START_TIMEOUT: Duration = Duration::from_secs(300);
@@ -146,18 +146,49 @@ impl App {
         &mut self,
         params: AgentStartParams,
     ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
-        let name = params.name;
+        self.start_agent_with_launcher(
+            params.name,
+            params.kind,
+            params.pane_id,
+            params.args,
+            params.timeout_ms,
+            AgentLauncher::Host,
+        )
+    }
+
+    pub(super) fn start_sbx_agent(
+        &mut self,
+        params: AgentStartSbxParams,
+    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+        self.start_agent_with_launcher(
+            params.name,
+            params.kind,
+            params.pane_id,
+            params.args,
+            params.timeout_ms,
+            AgentLauncher::Sbx,
+        )
+    }
+
+    fn start_agent_with_launcher(
+        &mut self,
+        name: String,
+        kind_label: String,
+        pane_id_param: String,
+        args: Vec<String>,
+        timeout_ms: Option<u64>,
+        launcher: AgentLauncher,
+    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
         if !valid_agent_name(&name) {
             return Err(AgentStartError::InvalidName);
         }
-        let Some(kind) = crate::detect::parse_agent_label(&params.kind) else {
-            return Err(AgentStartError::UnsupportedKind(params.kind));
+        let Some(kind) = crate::detect::parse_agent_label(&kind_label) else {
+            return Err(AgentStartError::UnsupportedKind(kind_label));
         };
-        if params
-            .args
-            .iter()
-            .any(|arg| arg.chars().any(char::is_control))
-        {
+        if launcher == AgentLauncher::Sbx && !crate::sbx::supports_agent(kind) {
+            return Err(AgentStartError::UnsupportedSbxKind(kind_label));
+        }
+        if args.iter().any(|arg| arg.chars().any(char::is_control)) {
             return Err(AgentStartError::InvalidArgument);
         }
         let conflicts = self.agent_name_conflicts(&name, "");
@@ -167,8 +198,8 @@ impl App {
                 candidates: conflicts,
             });
         }
-        let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(&params.pane_id) else {
-            return Err(AgentStartError::TargetNotFound(params.pane_id));
+        let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(&pane_id_param) else {
+            return Err(AgentStartError::TargetNotFound(pane_id_param));
         };
         let terminal_id = self
             .state
@@ -176,31 +207,39 @@ impl App {
             .get(ws_idx)
             .and_then(|workspace| workspace.terminal_id(pane_id))
             .cloned()
-            .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
+            .ok_or_else(|| AgentStartError::TargetNotFound(pane_id_param.clone()))?;
         let terminal = self
             .state
             .terminals
             .get(&terminal_id)
-            .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
+            .ok_or_else(|| AgentStartError::TargetNotFound(pane_id_param.clone()))?;
         if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
-            return Err(AgentStartError::TargetBusy(params.pane_id));
+            return Err(AgentStartError::TargetBusy(pane_id_param));
         }
         let runtime = self
             .terminal_runtimes
             .get(&terminal_id)
-            .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
+            .ok_or_else(|| AgentStartError::TargetUnavailable(pane_id_param.clone()))?;
         let shell_name = available_shell_name(runtime)
-            .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
+            .ok_or_else(|| AgentStartError::TargetBusy(pane_id_param.clone()))?;
 
         let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
-        argv.extend(params.args);
-        let command = crate::platform::interactive_shell_command(&argv, &shell_name)
+        argv.extend(args);
+        let launch_argv = match launcher {
+            AgentLauncher::Host => argv.clone(),
+            AgentLauncher::Sbx => crate::sbx::launch_argv(
+                crate::session::active_name().as_deref(),
+                &name,
+                kind,
+                &argv[1..],
+            )
+            .ok_or_else(|| AgentStartError::UnsupportedSbxKind(kind_label.clone()))?,
+        };
+        let command = crate::platform::interactive_shell_command(&launch_argv, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = Duration::from_millis(
-            params
-                .timeout_ms
-                .unwrap_or(DEFAULT_AGENT_START_TIMEOUT.as_millis() as u64),
+            timeout_ms.unwrap_or(DEFAULT_AGENT_START_TIMEOUT.as_millis() as u64),
         );
         if timeout <= AGENT_START_SETTLE_DELAY || timeout > MAX_AGENT_START_TIMEOUT {
             return Err(AgentStartError::InvalidTimeout);
@@ -211,8 +250,23 @@ impl App {
             .state
             .terminals
             .get_mut(&terminal_id)
-            .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
-        terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
+            .ok_or_else(|| AgentStartError::TargetUnavailable(pane_id_param.clone()))?;
+        match launcher {
+            AgentLauncher::Host => terminal.begin_managed_agent(
+                name.clone(),
+                kind,
+                now,
+                AGENT_START_SETTLE_DELAY,
+                timeout,
+            ),
+            AgentLauncher::Sbx => terminal.begin_managed_sbx_agent(
+                name.clone(),
+                kind,
+                now,
+                AGENT_START_SETTLE_DELAY,
+                timeout,
+            ),
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
@@ -222,7 +276,7 @@ impl App {
 
         let agent = self
             .agent_info(ws_idx, pane_id)
-            .ok_or(AgentStartError::TargetUnavailable(params.pane_id))?;
+            .ok_or(AgentStartError::TargetUnavailable(pane_id_param))?;
         Ok((agent, argv))
     }
 
@@ -238,6 +292,12 @@ impl App {
             AgentStartError::UnsupportedKind(kind) => crate::api::schema::ErrorBody {
                 code: "unsupported_agent_kind".into(),
                 message: format!("unsupported interactive agent kind {kind}"),
+            },
+            AgentStartError::UnsupportedSbxKind(kind) => crate::api::schema::ErrorBody {
+                code: "unsupported_sbx_agent_kind".into(),
+                message: format!(
+                    "Docker SBX startup currently supports only claude, codex, and kiro; got {kind}"
+                ),
             },
             AgentStartError::InvalidArgument => crate::api::schema::ErrorBody {
                 code: "invalid_agent_argument".into(),
@@ -443,6 +503,7 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
 pub(super) enum AgentStartError {
     InvalidName,
     UnsupportedKind(String),
+    UnsupportedSbxKind(String),
     InvalidArgument,
     InvalidTimeout,
     TargetNotFound(String),
@@ -453,6 +514,12 @@ pub(super) enum AgentStartError {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentLauncher {
+    Host,
+    Sbx,
 }
 
 pub(super) enum AgentRenameError {

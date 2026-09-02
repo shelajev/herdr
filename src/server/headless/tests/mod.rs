@@ -4883,6 +4883,7 @@ fn startup_idle_does_not_forward_completion() {
             pane_id,
             agent: Some(crate::detect::Agent::Pi),
             state: crate::detect::AgentState::Idle,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,

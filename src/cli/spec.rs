@@ -426,6 +426,11 @@ fn agent_command() -> Command {
                         .help("Existing pane at an interactive shell prompt"),
                 )
                 .arg(
+                    option("sandbox", "BACKEND")
+                        .value_parser(["sbx"])
+                        .help("Launch through Docker Sandboxes; never falls back to the host"),
+                )
+                .arg(
                     option("timeout", "MS")
                         .help("Wait for interactive readiness (default: 30000; max: 300000)"),
                 )
@@ -1299,6 +1304,7 @@ mod tests {
                 .map(str::to_string)
         );
         assert!(has_option(agent_start, "pane"));
+        assert_eq!(option_values(agent_start, "sandbox"), ["sbx"]);
         for legacy in ["cwd", "workspace", "tab", "split", "focus", "env", "argv"] {
             assert!(!has_option(agent_start, legacy), "legacy option --{legacy}");
         }

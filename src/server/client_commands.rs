@@ -316,6 +316,15 @@ mod tests {
         assert!(!supports_client_shell_method(&Method::ServerStop(
             crate::api::schema::EmptyParams::default(),
         )));
+        assert!(!supports_client_shell_method(&Method::AgentStartSbx(
+            crate::api::schema::AgentStartSbxParams {
+                name: "worker".into(),
+                kind: "codex".into(),
+                pane_id: "w1:p1".into(),
+                args: Vec::new(),
+                timeout_ms: None,
+            },
+        )));
     }
 
     #[test]

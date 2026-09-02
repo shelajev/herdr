@@ -360,6 +360,10 @@ fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> Stri
     let effective = process.argv0.as_deref().unwrap_or(&process.name);
     let lower_effective = effective.to_lowercase();
 
+    if let Some(agent) = crate::sbx::agent_from_process_argv(effective, process.argv.as_deref()) {
+        return agent_label(agent).to_string();
+    }
+
     if is_generic_runtime_or_shell(&lower_effective) {
         if let Some(wrapped_agent) =
             wrapped_agent_name_from_runtime_argv(&lower_effective, process.argv.as_deref())
@@ -960,6 +964,37 @@ mod tests {
             identify_agent_in_job(&job),
             Some((Agent::Codex, "codex".to_string()))
         );
+    }
+
+    #[test]
+    fn identify_agent_in_job_recognizes_sbx_wrapped_codex() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "sbx",
+                &["sbx", "run", "--name", "herdr-reviewer", "codex", "."],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Codex, "codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_does_not_treat_sbx_arguments_as_arbitrary_agents() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "sbx",
+                &["sbx", "exec", "codex", "sh"],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
     }
 
     #[test]

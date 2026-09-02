@@ -49,6 +49,16 @@ Successful `agent start` returns only after Herdr detects the expected agent in 
 herdr agent start reviewer --kind codex --pane "$review_pane" -- -m gpt-5.4
 ```
 
+Add `--sandbox sbx` to run the worker in Docker Sandboxes instead of on the host:
+
+```bash
+herdr agent start reviewer --kind codex --pane "$review_pane" --sandbox sbx -- -m gpt-5.4
+```
+
+This uses the pane's current shell directory as the SBX workspace and fails closed: the CLI sends the distinct `agent.start_sbx` API method and never retries with host `agent.start`. Claude, Codex, and Kiro are supported initially. Herdr waits for positive idle-screen evidence from the inner agent, so SBX image or microVM setup output is not treated as ready.
+
+For a thin-host leader, configure the leader's own agent harness to expose only the Herdr layout and agent commands needed to create panes, call sandboxed start, prompt workers, inspect output, and wait. Herdr does not remove shell or filesystem tools from the leader, and its same-user socket is not a capability boundary; those leader restrictions must come from the harness. SBX enforces worker containment.
+
 Agents launched manually are detected automatically and can be addressed by pane ID. Give one a name when a stable human-readable target is useful:
 
 ```bash
@@ -104,6 +114,8 @@ herdr agent start reviewer --kind codex --pane "$review_pane" -- -m gpt-5.4
 herdr agent prompt reviewer "Review the current diff" --wait --timeout 120000
 herdr agent read reviewer --source recent-unwrapped --lines 120
 ```
+
+To keep the helper off the host, use the same recipe with `--sandbox sbx` on the `agent start` command.
 
 Wait for an agent to ask for input, inspect it, and interact with its UI:
 

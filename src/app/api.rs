@@ -922,6 +922,9 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params)
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentStartSbx(params) => {
+                return self.handle_agent_start_sbx(request.id, params)
+            }
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(
@@ -1697,6 +1700,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -1706,6 +1710,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -1790,6 +1795,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -1799,6 +1805,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -1911,6 +1918,7 @@ mod tests {
                 pane_id,
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
+                visible_idle: false,
                 visible_blocker: false,
                 visible_working: false,
                 process_exited: true,
@@ -1965,6 +1973,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: true,
@@ -2138,6 +2147,7 @@ mod tests {
             pane_id,
             agent: Some(crate::detect::Agent::OpenCode),
             state: AgentState::Idle,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: true,
@@ -2202,6 +2212,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -2222,6 +2233,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
+            visible_idle: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,

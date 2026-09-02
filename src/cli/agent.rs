@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentSendKeysParams, AgentStartParams, AgentStartSbxParams, AgentTarget, AgentWaitParams,
+    EmptyParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat,
+    ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -288,7 +289,7 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--sandbox sbx] [--timeout MS] [-- <agent-args...>]");
         return Ok(2);
     };
     let separator = args
@@ -297,6 +298,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         .unwrap_or(args.len());
     let mut kind = None;
     let mut pane_id = None;
+    let mut sandbox = None;
     let mut timeout_ms = None;
     let mut index = 1;
     while index < separator {
@@ -326,6 +328,18 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                     Ok(timeout_ms) => Some(timeout_ms),
                     Err(exit_code) => return Ok(exit_code),
                 };
+                index += 2;
+            }
+            "--sandbox" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --sandbox");
+                    return Ok(2);
+                };
+                if value != "sbx" {
+                    eprintln!("unsupported sandbox: {value}");
+                    return Ok(2);
+                }
+                sandbox = Some(value.clone());
                 index += 2;
             }
             other => {
@@ -369,15 +383,26 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             }
         }
 
-        let response = super::send_request(&Request {
-            id: "cli:agent:start".into(),
-            method: Method::AgentStart(AgentStartParams {
+        let method = if sandbox.as_deref() == Some("sbx") {
+            Method::AgentStartSbx(AgentStartSbxParams {
                 name: name.clone(),
                 kind: kind.clone(),
                 pane_id: pane_id.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
-            }),
+            })
+        } else {
+            Method::AgentStart(AgentStartParams {
+                name: name.clone(),
+                kind: kind.clone(),
+                pane_id: pane_id.clone(),
+                args: agent_args.clone(),
+                timeout_ms,
+            })
+        };
+        let response = super::send_request(&Request {
+            id: "cli:agent:start".into(),
+            method,
         })?;
         if response.get("error").is_none() {
             break response;
@@ -931,7 +956,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
-        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
+        "  herdr agent start <name> --kind KIND --pane ID [--sandbox sbx] [--timeout MS] [-- <agent-args...>]"
     );
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(

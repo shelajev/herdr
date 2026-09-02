@@ -152,6 +152,26 @@ fn agent_start_and_prompt_requests_round_trip() {
 }
 
 #[test]
+fn agent_start_sbx_request_has_a_distinct_fail_closed_method() {
+    let request = Request {
+        id: "start-sbx".into(),
+        method: Method::AgentStartSbx(AgentStartSbxParams {
+            name: "reviewer".into(),
+            kind: "codex".into(),
+            pane_id: "w1:p2".into(),
+            args: vec!["--model".into(), "gpt-5".into()],
+            timeout_ms: Some(60_000),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "agent.start_sbx");
+    assert_eq!(json["params"]["kind"], "codex");
+    assert_eq!(json["params"]["args"][0], "--model");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+}
+
+#[test]
 fn bundled_protocol_schema_refs_resolve_inside_bundle() {
     fn assert_no_standalone_refs(value: &serde_json::Value) {
         match value {

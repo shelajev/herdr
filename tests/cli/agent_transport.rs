@@ -1,6 +1,79 @@
 use super::harness::*;
 
 #[test]
+fn agent_start_sbx_uses_only_the_fail_closed_sandbox_method() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut pane_stream, pane_line) = accept_fake_cli_operation(&listener);
+        let pane: serde_json::Value = serde_json::from_str(&pane_line).unwrap();
+        assert_eq!(pane["method"], "pane.get");
+        writeln!(
+            pane_stream,
+            "{}",
+            serde_json::json!({
+                "id": pane["id"],
+                "result": {
+                    "type": "pane_info",
+                    "pane": { "terminal_id": "term_1" }
+                }
+            })
+        )
+        .unwrap();
+        pane_stream.flush().unwrap();
+
+        let (mut start_stream, start_line) = accept_fake_cli_operation(&listener);
+        let start: serde_json::Value = serde_json::from_str(&start_line).unwrap();
+        assert_eq!(start["method"], "agent.start_sbx");
+        assert_eq!(start["params"]["kind"], "codex");
+        assert_eq!(
+            start["params"]["args"],
+            serde_json::json!(["--model", "gpt-5"])
+        );
+        writeln!(
+            start_stream,
+            "{}",
+            serde_json::json!({
+                "id": start["id"],
+                "error": {
+                    "code": "unknown_method",
+                    "message": "agent.start_sbx is unavailable"
+                }
+            })
+        )
+        .unwrap();
+        start_stream.flush().unwrap();
+    });
+
+    let started = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "reviewer",
+            "--kind",
+            "codex",
+            "--pane",
+            "w1:p1",
+            "--sandbox",
+            "sbx",
+            "--",
+            "--model",
+            "gpt-5",
+        ],
+    );
+    assert_eq!(started.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&started.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "unknown_method");
+
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn agent_start_waits_through_unknown_then_rejects_blocked() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();

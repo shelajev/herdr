@@ -141,6 +141,102 @@ fn agent_start_waits_for_a_new_pane_shell_to_finish_initializing() {
 }
 
 #[test]
+fn agent_start_sbx_launches_the_wrapper_and_keeps_agent_controls_working() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    let captured_args = base.join("sbx-args");
+    let captured_cwd = base.join("sbx-cwd");
+    let captured_prompts = base.join("sbx-prompts");
+    let host_agent_marker = base.join("host-codex-ran");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("sbx"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\npwd > '{}'\nexport HERDR_AGENT=codex\nprintf '\\033]0;Codex\\007'\nwhile IFS= read -r prompt; do printf '%s\\n' \"$prompt\" >> '{}'; done\n",
+            captured_args.display(),
+            captured_cwd.display(),
+            captured_prompts.display(),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        bin.join("codex"),
+        format!("#!/bin/sh\ntouch '{}'\n", host_agent_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("sbx"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+
+    let started = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "sandboxed",
+            "--kind",
+            "codex",
+            "--pane",
+            pane_id,
+            "--sandbox",
+            "sbx",
+            "--timeout",
+            "8000",
+            "--",
+            "--model",
+            "gpt-5",
+        ],
+    );
+
+    assert_eq!(started["result"]["agent"]["name"], "sandboxed");
+    assert_eq!(started["result"]["agent"]["agent"], "codex");
+    assert_eq!(started["result"]["agent"]["interactive_ready"], true);
+    assert_eq!(
+        started["result"]["argv"],
+        serde_json::json!(["codex", "--model", "gpt-5"])
+    );
+    let args = fs::read_to_string(&captured_args)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(args[0..2], ["run", "--name"]);
+    assert!(args[2].starts_with("herdr-sandboxed-"));
+    assert_eq!(args[3..], ["codex", ".", "--", "--model", "gpt-5"]);
+    assert_eq!(
+        fs::read_to_string(&captured_cwd).unwrap().trim(),
+        base.to_str().unwrap()
+    );
+    assert!(!host_agent_marker.exists());
+
+    let prompted = run_cli(
+        &socket_path,
+        &["agent", "prompt", "sandboxed", "implement it"],
+    );
+    assert!(prompted.status.success());
+    assert!(wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(25),
+        || fs::read_to_string(&captured_prompts)
+            .is_ok_and(|prompts| prompts.contains("implement it"))
+    ));
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
 fn agent_start_stops_retrying_when_the_pane_shell_stays_busy() {
     let base = unique_test_dir();
     let config_home = base.join("config");

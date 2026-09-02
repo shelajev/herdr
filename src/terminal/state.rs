@@ -73,6 +73,8 @@ enum ManagedAgentPhase {
 struct ManagedAgent {
     kind: Agent,
     phase: ManagedAgentPhase,
+    requires_visible_idle: bool,
+    visible_idle_observed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,7 +316,7 @@ impl TerminalState {
         agent: Option<Agent>,
         fallback_state: AgentState,
         visible_blocker: bool,
-        _visible_idle: bool,
+        visible_idle: bool,
         _visible_working: bool,
         process_exited: bool,
         now: Instant,
@@ -325,6 +327,15 @@ impl TerminalState {
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_detected_agent = self.detected_agent;
         let previous_session = self.current_session_identity_for_persistence();
+        if visible_idle {
+            if let Some(managed) = self
+                .managed_agent
+                .as_mut()
+                .filter(|managed| agent == Some(managed.kind))
+            {
+                managed.visible_idle_observed = true;
+            }
+        }
         let newer_custom_authority = process_exited
             && self.hook_authority.as_ref().is_some_and(|authority| {
                 crate::detect::parse_agent_label(&authority.agent_label) == agent
@@ -1901,6 +1912,29 @@ impl TerminalState {
         settle_delay: Duration,
         timeout: Duration,
     ) {
+        self.begin_managed_agent_with_readiness(name, kind, now, settle_delay, timeout, false);
+    }
+
+    pub fn begin_managed_sbx_agent(
+        &mut self,
+        name: String,
+        kind: Agent,
+        now: Instant,
+        settle_delay: Duration,
+        timeout: Duration,
+    ) {
+        self.begin_managed_agent_with_readiness(name, kind, now, settle_delay, timeout, true);
+    }
+
+    fn begin_managed_agent_with_readiness(
+        &mut self,
+        name: String,
+        kind: Agent,
+        now: Instant,
+        settle_delay: Duration,
+        timeout: Duration,
+        requires_visible_idle: bool,
+    ) {
         self.set_agent_name(name);
         self.agent_name_owner = Some(AgentNameOwner {
             agent_label: crate::detect::agent_label(kind).to_string(),
@@ -1913,6 +1947,8 @@ impl TerminalState {
                 deadline: now.checked_add(timeout).unwrap_or(now),
                 observed_expected: false,
             },
+            requires_visible_idle,
+            visible_idle_observed: false,
         });
     }
 
@@ -1967,10 +2003,14 @@ impl TerminalState {
             return true;
         }
         if managed.phase == ManagedAgentPhase::Blocked {
-            if known_agent == Some(managed.kind) && self.state == AgentState::Idle {
+            if known_agent == Some(managed.kind)
+                && self.state == AgentState::Idle
+                && (!managed.requires_visible_idle || managed.visible_idle_observed)
+            {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
                     phase: ManagedAgentPhase::Active,
+                    ..managed
                 });
                 return true;
             }
@@ -1986,6 +2026,7 @@ impl TerminalState {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
                     phase: ManagedAgentPhase::Blocked,
+                    ..managed
                 });
                 return true;
             }
@@ -1994,10 +2035,14 @@ impl TerminalState {
                 return true;
             }
             if ready_after.is_none_or(|ready_after| now >= ready_after) {
-                if known_agent == Some(managed.kind) && self.state == AgentState::Idle {
+                if known_agent == Some(managed.kind)
+                    && self.state == AgentState::Idle
+                    && (!managed.requires_visible_idle || managed.visible_idle_observed)
+                {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
                         phase: ManagedAgentPhase::Active,
+                        ..managed
                     });
                     return true;
                 }
@@ -2009,6 +2054,7 @@ impl TerminalState {
                             deadline,
                             observed_expected,
                         },
+                        ..managed
                     });
                     return true;
                 }
@@ -2021,6 +2067,7 @@ impl TerminalState {
                         deadline,
                         observed_expected,
                     },
+                    ..managed
                 });
                 return true;
             }
@@ -2037,6 +2084,8 @@ impl TerminalState {
         self.managed_agent = Some(ManagedAgent {
             kind,
             phase: ManagedAgentPhase::Active,
+            requires_visible_idle: false,
+            visible_idle_observed: false,
         });
     }
 
@@ -2243,6 +2292,45 @@ mod tests {
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), true));
         assert_eq!(terminal.agent_name, None);
+    }
+
+    #[test]
+    fn managed_sbx_agent_requires_positive_idle_screen_evidence() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.begin_managed_sbx_agent(
+            "reviewer".into(),
+            Agent::Codex,
+            now,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            now,
+        );
+
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(100), false));
+        assert!(terminal.managed_agent_launch_pending());
+        assert!(!terminal.managed_agent_interactive_ready());
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now + Duration::from_millis(101),
+        );
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(101), false));
+        assert!(!terminal.managed_agent_launch_pending());
+        assert!(terminal.managed_agent_interactive_ready());
     }
 
     #[test]

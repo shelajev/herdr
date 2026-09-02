@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams,
+    AgentStartSbxParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -52,6 +52,19 @@ impl App {
 
     pub(super) fn handle_agent_start(&mut self, id: String, params: AgentStartParams) -> String {
         let (agent, argv) = match self.start_agent(params) {
+            Ok(started) => started,
+            Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
+        };
+
+        encode_success(id, ResponseResult::AgentStarted { agent, argv })
+    }
+
+    pub(super) fn handle_agent_start_sbx(
+        &mut self,
+        id: String,
+        params: AgentStartSbxParams,
+    ) -> String {
+        let (agent, argv) = match self.start_sbx_agent(params) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
         };
