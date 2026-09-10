@@ -1,0 +1,24 @@
+#!/bin/bash
+# Sandbox entrypoint for the herdr-crew kit.
+#
+# Interactive attach (sbx run / sbx attach with a TTY): open the herdr TUI.
+# The TUI starts the headless server on demand, so the crew session is the
+# same one the host reaches over `herdr --remote ssh://<name>.sbx`.
+#
+# Non-interactive main process (detached sandbox): supervise the headless
+# server so the crew stays reachable — restart it if it ever exits.
+set -u
+
+export PATH="/home/agent/.local/bin:$PATH"
+
+if [ -t 1 ]; then
+  exec herdr
+fi
+
+while true; do
+  if ! herdr status server >/dev/null 2>&1; then
+    herdr server >>/tmp/herdr-server.log 2>&1
+    echo "herdr-crew: herdr server exited ($?), restarting in 5s" >>/tmp/herdr-server.log
+  fi
+  sleep 5
+done

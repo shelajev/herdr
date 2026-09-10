@@ -1,0 +1,267 @@
+schemaVersion: "2"
+kind: sandbox
+name: herdr-crew
+version: "0.4.1"
+displayName: Herdr Crew
+description: |
+  Task sandbox running a nested Herdr server and a crew of coding agents
+  (Claude Code, Codex, pi with Google models) in rotating roles: a sandboxed orchestrator
+  that holds the goal, plus planner, implementer, and QC. The host only
+  delivers goals and arbitrates resources.
+sourceURL: https://github.com/shelajev/herdr
+
+# Tool installation lives in the template image (template/Dockerfile), not in
+# install commands: the image is cached by the sandbox runtime, so creating a
+# new task sandbox is fast. The install step below only verifies the tools
+# exist. `sandbox.build` is parsed but not runtime-supported yet, so the image
+# must be prebuilt — see scripts/sbx/build-crew-template.sh.
+args:
+  image:
+    default: docker.io/olegselajev241/herdr-crew:latest
+    description: Herdr crew template image (published, linux/arm64; for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh)
+  roles:
+    default: orchestrator=claude,planner=codex,implementer=claude,qc=pi
+    description: Role assignment for this task; the host rotates this per task and guarantees qc differs from implementer
+  gemini_model:
+    default: gemini-3.8-flash
+    description: Google model the pi role pins with --provider google --model
+
+sandbox:
+  image: "${{ kit.args.image }}"
+  entrypoint: [crew-entry]
+
+agentInstructions:
+  filename: AGENTS.md
+  content: |
+    ## Herdr crew
+
+    This sandbox runs a crew of coding agents: an orchestrator that holds the
+    task goal and coordinates everyone through the local herdr CLI, plus a
+    planner, an implementer, and quality control. Your role is named in the
+    prompt you receive; read your prompt pack in `/home/agent/crew/roles/`
+    and follow it. Only the orchestrator drives other agents; every other
+    role works solely on what it is prompted with. The role-to-agent
+    assignment for this task is recorded in `/home/agent/crew/assignment`.
+
+    Shared crew files under `/home/agent/crew/`: `goal.md` (the goal, owned by
+    the orchestrator), `plan.md` (the plan, owned by the planner), `qc-log.md`
+    (findings and VERDICT lines, owned by qc), `status.md` (progress notes and
+    the final RESULT line, owned by the orchestrator), and `escalations.md`
+    (resource requests for the host to approve or deny).
+
+credentials:
+  # Injection domains, headers, and OAuth blocks are taken verbatim from the
+  # built-in claude/codex kits embedded in sbx v0.42 (extracted 2026-09-08).
+  # proxyManaged keys mean the real secret never enters the VM; the oauth
+  # blocks let the proxy intercept subscription logins (Claude Pro/Max,
+  # ChatGPT Plus/Pro) at the token endpoint, keep real tokens host-side, and
+  # substitute sentinels in the sandbox. API key takes precedence when both
+  # resolve; OAuth is the fallback.
+  # NOTE: anthropic/openai deliberately do NOT set proxyManaged (matching the
+  # official kits): a sentinel in ANTHROPIC_API_KEY/OPENAI_API_KEY would force
+  # the CLIs down the API-key path even in OAuth mode, sending the literal
+  # sentinel upstream ("Invalid API key"). API-key mode is handled by the
+  # seeded settings/auth files gated on SBX_CRED_<SERVICE>_MODE instead.
+  # gemini keeps proxyManaged because pi requires the env var to be present
+  # before it attempts a Google request.
+  - service: anthropic
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      inject:
+        - domain: api.anthropic.com
+          header: x-api-key
+          format: "%s"
+        - domain: claude.ai
+          header: x-api-key
+          format: "%s"
+        - domain: console.anthropic.com
+          header: x-api-key
+          format: "%s"
+    oauth:
+      tokenEndpoint:
+        host: platform.claude.com
+        path: /v1/oauth/token
+      sentinels:
+        accessToken: sk-ant-oat01-proxy-managed
+        refreshToken: sk-ant-ort01-proxy-managed
+      credentialFile:
+        path: "~/.claude/.credentials.json"
+        template: '{"claudeAiOauth":{"accessToken":"{{.AccessToken}}","refreshToken":"{{.RefreshToken}}","expiresAt":{{.ExpiresAt}},"scopes":{{.ScopesJSON}}}{{if .PrimaryApiKey}},"primaryApiKey":"{{.PrimaryApiKey}}"{{end}}}'
+      skipIfEnv:
+        - ANTHROPIC_API_KEY
+  - service: openai
+    apiKey:
+      name: OPENAI_API_KEY
+      inject:
+        - domain: api.openai.com
+          header: Authorization
+          format: Bearer %s
+        - domain: openai.com
+          header: Authorization
+          format: Bearer %s
+    oauth:
+      tokenEndpoint:
+        host: auth.openai.com
+        path: /oauth/token
+      resourceHosts:
+        - chatgpt.com
+      sentinels:
+        accessToken: oai-oat01-proxy-managed
+        refreshToken: oai-ort01-proxy-managed
+      skipIfEnv:
+        - OPENAI_API_KEY
+  - service: gemini
+    required: true
+    apiKey:
+      name: GEMINI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: generativelanguage.googleapis.com
+          header: x-goog-api-key
+          format: "%s"
+
+permissions:
+  network:
+    allow:
+      # Model APIs (must match every credential injection domain above).
+      - api.anthropic.com
+      - statsig.anthropic.com
+      - claude.ai
+      - console.anthropic.com
+      - platform.claude.com
+      - downloads.claude.ai
+      - claude.com
+      - code.claude.com
+      - api.openai.com
+      - openai.com
+      - auth.openai.com
+      - chatgpt.com
+      - files.openai.com
+      - codeload.github.com
+      - generativelanguage.googleapis.com
+      # Source and packages for the actual task work.
+      - github.com
+      - api.github.com
+      - raw.githubusercontent.com
+      - objects.githubusercontent.com
+      - release-assets.githubusercontent.com
+      - registry.npmjs.org
+      # apt sources shipped in the shell-docker base (amd64 + arm64 + docker).
+      - archive.ubuntu.com
+      - security.ubuntu.com
+      - ports.ubuntu.com
+      - download.docker.com
+
+environment:
+  variables:
+    IS_SANDBOX: "1"
+    HERDR_CREW: "1"
+    HERDR_CREW_GEMINI_MODEL: "${{ kit.args.gemini_model }}"
+    CODEX_HOME: /home/agent/.codex
+    # git must never block on an interactive credential prompt in a headless
+    # sandbox (matches the built-in codex kit).
+    GIT_TERMINAL_PROMPT: "0"
+
+setup:
+  install:
+    # Fast: tools are baked into the template image; this only verifies them
+    # and fails creation early with a clear message on a wrong image.
+    - command: crew-check
+      user: "1000"
+      description: Verify herdr and the crew agent CLIs are present
+    # The three seeding commands below are taken from the built-in claude and
+    # codex kits (sbx v0.42) so subscription OAuth and non-interactive startup
+    # behave identically to `sbx run claude` / `sbx run codex`. The
+    # SBX_CRED_<SERVICE>_MODE env vars are set by the sandbox engine from the
+    # host-side credential state (oauth|apikey|none).
+    - command: |
+        set -e
+        ws="${WORKSPACE_DIR:-/}"
+        esc=$(printf '%s' "$ws" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g')
+        projects="\"/\": { \"hasTrustDialogAccepted\": true }"
+        [ "$ws" = "/" ] || projects="$projects, \"$esc\": { \"hasTrustDialogAccepted\": true }"
+        printf '%s\n' "{
+          \"bypassPermissionsModeAccepted\": true,
+          \"hasCompletedOnboarding\": true,
+          \"projects\": { $projects }
+        }" > /home/agent/.claude.json
+        chown agent:agent /home/agent/.claude.json
+      user: "0"
+      description: Seed Claude bypass/trust flags
+    - command: |
+        set -e
+        mkdir -p /home/agent/.claude
+        HELPER=''
+        if [ "${SBX_CRED_ANTHROPIC_MODE:-none}" != none ]; then
+          HELPER='  "apiKeyHelper": "echo proxy-managed",
+        '
+        fi
+        printf '%s' "{
+          \"themeId\": 1,
+          \"alwaysThinkingEnabled\": true,
+        ${HELPER}  \"permissions\": { \"defaultMode\": \"bypassPermissions\" },
+          \"bypassPermissionsModeAccepted\": true,
+          \"skipDangerousModePermissionPrompt\": true
+        }
+        " > /home/agent/.claude/settings.json
+      user: "agent"
+      description: Seed Claude settings.json from SBX_CRED_ANTHROPIC_MODE
+    - command: |
+        set -e
+        mkdir -p /home/agent/.codex
+        MODE="${SBX_CRED_OPENAI_MODE:-none}"
+        cat > /home/agent/.codex/config.toml << 'EOF'
+        approval_policy = "never"
+        sandbox_mode = "danger-full-access"
+        mcp_oauth_credentials_store = "file"
+        EOF
+        case "$MODE" in
+          oauth|apikey)
+            cat >> /home/agent/.codex/config.toml << 'EOF'
+        forced_login_method = "api"
+        EOF
+            ;;
+        esac
+        if [ "$MODE" = oauth ]; then
+          cat >> /home/agent/.codex/config.toml << 'EOF'
+        model_provider = "sandboxd"
+        [model_providers.sandboxd]
+        name = "Sandbox Proxy"
+        base_url = "https://chatgpt.com/backend-api/codex"
+        experimental_bearer_token = "oai-oat01-proxy-managed"
+        requires_openai_auth = false
+        EOF
+        fi
+        case "$MODE" in
+          oauth|apikey)
+            cat > /home/agent/.codex/auth.json << 'EOF'
+        {
+          "OPENAI_API_KEY": "proxy-managed"
+        }
+        EOF
+            ;;
+          *)
+            rm -f /home/agent/.codex/auth.json
+            ;;
+        esac
+      user: "agent"
+      description: Seed Codex config/auth from SBX_CRED_OPENAI_MODE
+  startup:
+    # The sandbox entrypoint (crew-entry) only runs when someone attaches, so
+    # a detached task sandbox needs the herdr server started as a boot
+    # service. Startup commands run on every sandbox start; the pgrep guard
+    # keeps this idempotent.
+    - command:
+        - sh
+        - -c
+        - pgrep -f 'herdr server' >/dev/null 2>&1 || exec herdr server >>/tmp/herdr-server.log 2>&1
+      user: "agent"
+      background: true
+      description: Keep the headless herdr server running in detached sandboxes
+  files:
+    - path: /home/agent/crew/assignment
+      content: "${{ kit.args.roles }}"
+      description: Role-to-agent assignment for this task
+    - path: /home/agent/crew/workdir
+      content: "${WORKDIR}"
+      description: Absolute workspace path, read by the host task driver
