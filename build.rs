@@ -61,10 +61,16 @@ fn main() {
         .to_string();
 
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
+    // Install into cargo's per-target OUT_DIR instead of the in-tree zig-out
+    // so builds for different targets (e.g. a macOS host and a Linux sandbox
+    // sharing one checkout) never overwrite each other's static library.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let mut command = Command::new(&zig);
     command
         .arg("build")
         .arg("-Demit-lib-vt")
+        .arg("--prefix")
+        .arg(&out_dir)
         .arg(format!("-Doptimize={optimize}"))
         .arg(format!("-Dsimd={simd}"))
         .arg(format!("-Dtarget={zig_target}"))
@@ -94,7 +100,7 @@ fn main() {
         "zig build for vendored libghostty-vt failed: {status}"
     );
 
-    let lib_dir = vendored_dir.join("zig-out/lib");
+    let lib_dir = out_dir.join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     if target.contains("apple-darwin") {
         let static_lib = lib_dir.join("libghostty-vt.a");
