@@ -35,6 +35,7 @@ pub(super) fn command() -> Command {
         .subcommand(workspace_command())
         .subcommand(worktree_command())
         .subcommand(tab_command())
+        .subcommand(task_command())
         .subcommand(notification_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
@@ -302,6 +303,52 @@ fn tab_command() -> Command {
                 .arg(required("label", "LABEL").num_args(1..)),
         )
         .subcommand(id_command("close", "tab_id", "Close a tab"))
+}
+
+fn task_command() -> Command {
+    Command::new("task")
+        .about("Run crew task sandboxes (Docker SBX + herdr-crew kit)")
+        .subcommand(
+            Command::new("new")
+                .about("Provision a task sandbox with a rotated agent crew")
+                .arg(required("slug", "SLUG"))
+                .arg(path_option("dir", "PATH").help("Workspace directory (default: current)"))
+                .arg(option("kit", "REF").help("herdr-crew kit reference"))
+                .arg(
+                    option("mixin", "REF")
+                        .action(ArgAction::Append)
+                        .help("Extra sbx mixin kit to stack onto the sandbox (repeatable)"),
+                )
+                .arg(option("roles", "SPEC").help(
+                    "orchestrator=KIND,planner=KIND,implementer=KIND,qc=KIND (qc must differ from implementer)",
+                )),
+        )
+        .subcommand(
+            Command::new("goal")
+                .about("Deliver a goal to the task's sandboxed orchestrator")
+                .arg(required("slug", "SLUG"))
+                .arg(required("text", "TEXT"))
+                .arg(flag("no-watch").help("Return after delivery instead of watching progress")),
+        )
+        .subcommand(id_command(
+            "watch",
+            "slug",
+            "Watch crew status and escalations until a RESULT line",
+        ))
+        .subcommand(Command::new("ls").about("List task sandboxes"))
+        .subcommand(id_command("status", "slug", "Show crew agent states"))
+        .subcommand(id_command(
+            "attach",
+            "slug",
+            "Attach to the task's herdr over SSH",
+        ))
+        .subcommand(
+            Command::new("policy")
+                .about("Show or apply network escalations for a task sandbox")
+                .arg(required("slug", "SLUG"))
+                .arg(option("allow", "DOMAIN").help("Allow a domain for this task's sandbox")),
+        )
+        .subcommand(id_command("rm", "slug", "Remove a task sandbox"))
 }
 
 fn notification_command() -> Command {
