@@ -41,25 +41,35 @@ pub(crate) const STARTUP_CWD_ENV_VAR: &str = "HERDR_STARTUP_CWD";
 /// server) are detected because connect returns `ConnectionRefused`
 /// when nobody is listening.
 #[allow(dead_code)] // Public API for external use and testing
-pub fn is_server_listening() -> bool {
+pub fn is_server_listening() -> io::Result<bool> {
     is_server_listening_at(&client_socket_path())
 }
 
 /// Checks whether a herdr server is listening at a specific socket path.
-fn is_server_listening_at(socket_path: &Path) -> bool {
+fn is_server_listening_at(socket_path: &Path) -> io::Result<bool> {
     #[cfg(windows)]
     {
-        let _ = socket_path;
-        read_server_status().ok().flatten().is_some()
+        match crate::platform::probe_local_server(socket_path) {
+            Ok(()) => Ok(true),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     #[cfg(not(windows))]
     {
         if !socket_path.exists() {
-            return false;
+            return Ok(false);
         }
 
-        match crate::ipc::connect_local_stream(socket_path) {
+        Ok(match crate::ipc::connect_local_stream(socket_path) {
             Ok(_) => {
                 // Server is listening. Close the test connection immediately.
                 // The server's handshake handler will time out on this connection
@@ -84,7 +94,7 @@ fn is_server_listening_at(socket_path: &Path) -> bool {
                 tracing::warn!(err = %err, "unexpected error checking server socket");
                 false
             }
-        }
+        })
     }
 }
 
@@ -142,7 +152,7 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
     }
 }
 
-fn validate_running_server_compatibility() -> io::Result<()> {
+fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<()> {
     let Some(status) = read_server_status()? else {
         return Err(io::Error::other(format!(
             "a herdr server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
@@ -150,16 +160,23 @@ fn validate_running_server_compatibility() -> io::Result<()> {
         )));
     };
 
-    let endpoint_generation = status
-        .capabilities
-        .as_ref()
-        .and_then(|capabilities| capabilities.endpoint_protocol_generation);
-    if endpoint_generation == Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION) {
+    let capabilities = status.capabilities.as_ref();
+    let endpoint_generation =
+        capabilities.and_then(|capabilities| capabilities.endpoint_protocol_generation);
+    let surface_interest = capabilities.is_some_and(|capabilities| capabilities.surface_interest);
+    if endpoint_generation == Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION)
+        && (!saved_federation || surface_interest)
+    {
         return Ok(());
     }
 
+    let requirement = if saved_federation && !surface_interest {
+        "saved SSH machines require surface lifecycle support"
+    } else {
+        "the stable endpoint generation is incompatible"
+    };
     Err(io::Error::other(format!(
-        "This session predates Herdr's stable endpoint protocol and needs one final server update.\n\nserver: v{} endpoint generation {}\nclient: v{} endpoint generation {}\n\n{}",
+        "This session needs one final server update before Herdr can attach ({requirement}).\n\nserver: v{} endpoint generation {}\nclient: v{} endpoint generation {}\n\n{}",
         status.version.as_deref().unwrap_or("unknown"),
         endpoint_generation
             .map(|value| value.to_string())
@@ -253,7 +270,7 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
         }
 
         #[cfg(not(windows))]
-        if is_server_listening_at(socket_path) {
+        if is_server_listening_at(socket_path)? {
             info!(path = %socket_path.display(), "server socket ready");
             return Ok(());
         }
@@ -285,18 +302,37 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 /// 1. Check if a server is listening on the client socket
 /// 2. If no server → spawn server daemon → wait for socket readiness
 /// 3. Run the thin client (which connects to the server)
-pub fn auto_detect_launch() -> io::Result<()> {
+pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
+    // The client requires terminal geometry before it can attach. Reject an
+    // unusable terminal before socket lookup creates directories or starts a daemon.
+    crate::platform::terminal_grid_size().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot attach without a usable terminal: {err}; run inside a terminal"),
+        )
+    })?;
     let socket_path = client_socket_path();
     info!(path = %socket_path.display(), "auto-detect launch starting");
 
-    if is_server_listening_at(&socket_path) {
-        validate_running_server_compatibility()?;
-        info!("server already running, attaching as client");
-    } else {
-        info!("no server running, spawning server daemon");
-        spawn_server_daemon()?;
-        wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT)?;
-        info!("server ready, attaching as client");
+    let startup = is_server_listening().and_then(|listening| {
+        if listening {
+            info!("server already running, attaching as client");
+            if saved_federation {
+                Ok(())
+            } else {
+                validate_running_server_compatibility(false)
+            }
+        } else {
+            info!("no server running, spawning server daemon");
+            spawn_server_daemon()
+                .and_then(|_| wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT))
+        }
+    });
+    if let Err(error) = startup {
+        if !saved_federation {
+            return Err(error);
+        }
+        tracing::warn!(%error, "Local startup failed; keeping saved machines available");
     }
 
     // Now attach as a thin client.
@@ -306,6 +342,71 @@ pub fn auto_detect_launch() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+    use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+
+    #[test]
+    fn reachability_distinguishes_denied_silent_busy_and_absent_pipes() {
+        let path =
+            std::env::temp_dir().join(format!("herdr-startup-probe-{}.sock", std::process::id()));
+        let name = path.to_string_lossy();
+        let denied = ListenerOptions::new()
+            .name(name.to_ns_name::<GenericNamespaced>().unwrap())
+            .security_descriptor(
+                SecurityDescriptor::deserialize(
+                    &widestring::U16CString::from_str("D:P(A;;GA;;;SY)").unwrap(),
+                )
+                .unwrap(),
+            )
+            .create_sync()
+            .unwrap();
+        assert_eq!(
+            is_server_listening_at(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(denied);
+        // A real listener that never answers the status API is still present:
+        // automatic startup must not replace it just because it is unresponsive.
+        let silent = crate::ipc::bind_local_listener(&path).unwrap();
+        assert!(is_server_listening_at(&path).unwrap());
+        drop(silent);
+        let busy = crate::ipc::bind_local_listener(&path).unwrap();
+        let occupied = crate::ipc::connect_local_stream(&path).unwrap();
+        let start_probe = || {
+            let probe_path = path.clone();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = result_tx.send(is_server_listening_at(&probe_path));
+            });
+            result_rx
+        };
+        assert_eq!(
+            start_probe()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("an occupied pipe must not block startup")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        let retry = start_probe();
+        assert!(matches!(
+            retry.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        let accepted = busy.accept().unwrap();
+        assert!(retry.recv_timeout(Duration::from_secs(5)).unwrap().unwrap());
+        drop(accepted);
+        drop(occupied);
+        drop(busy);
+        assert!(!is_server_listening_at(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -332,7 +433,7 @@ mod tests {
     fn is_server_listening_returns_false_for_nonexistent_path() {
         let dir = unique_test_dir("nonexistent");
         let path = dir.join("s.sock");
-        assert!(!is_server_listening_at(&path));
+        assert!(!is_server_listening_at(&path).unwrap());
     }
 
     #[test]
@@ -400,7 +501,7 @@ test "$sid" = "$$"
         let path = dir.join("s.sock");
 
         let _listener = UnixListener::bind(&path).unwrap();
-        assert!(is_server_listening_at(&path));
+        assert!(is_server_listening_at(&path).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -417,7 +518,7 @@ test "$sid" = "$$"
         }
 
         // The socket file exists but nobody is listening.
-        assert!(!is_server_listening_at(&path));
+        assert!(!is_server_listening_at(&path).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -431,7 +532,7 @@ test "$sid" = "$$"
         drop(UnixListener::bind(&path).unwrap());
 
         // Socket is stale — should return false.
-        assert!(!is_server_listening_at(&path));
+        assert!(!is_server_listening_at(&path).unwrap());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -522,7 +623,7 @@ test "$sid" = "$$"
         let path = dir.join("api.sock");
         std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
 
-        let err = validate_running_server_compatibility().unwrap_err();
+        let err = validate_running_server_compatibility(false).unwrap_err();
 
         assert!(
             err.to_string().contains("status API is unavailable"),
@@ -558,7 +659,7 @@ test "$sid" = "$$"
             stream.flush().unwrap();
         });
 
-        let err = validate_running_server_compatibility().unwrap_err();
+        let err = validate_running_server_compatibility(false).unwrap_err();
         let message = err.to_string();
 
         let _ = handle.join();

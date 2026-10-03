@@ -13,6 +13,25 @@ pub(crate) fn set_default_plugin_pane_pwd(
 ) {
 }
 
+#[cfg(unix)]
+pub(super) const REMOTE_BRIDGE_CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
+pub(crate) fn forward_remote_bridge_stdio(
+    stream: crate::ipc::LocalStream,
+    _idle_timeout: bool,
+) -> std::io::Result<()> {
+    use interprocess::TryClone as _;
+
+    let mut stdout = std::io::stdout().lock();
+    let mut socket_to_stdout = stream.try_clone()?;
+    let mut stdin_to_socket = stream;
+    let _upload = std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let _ = std::io::copy(&mut stdin, &mut stdin_to_socket);
+    });
+    std::io::copy(&mut socket_to_stdout, &mut stdout).map(|_| ())
+}
+
 #[cfg(not(unix))]
 pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
     crossterm::terminal::size()
@@ -213,6 +232,11 @@ pub fn write_clipboard(_bytes: &[u8]) -> bool {
 
 /// Unsupported platform stub.
 pub fn read_clipboard_text() -> Option<String> {
+    None
+}
+
+/// Unsupported platform stub.
+pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
     None
 }
 

@@ -2,15 +2,29 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 mod actions;
 mod agent_sidebar;
+mod aggregate_navigation;
+mod machine_diagnostics;
+mod workspace_navigation;
+use workspace_navigation::{PendingWorkspaceHighlight, WorkspaceNavigationTarget};
 mod composition;
 mod config;
 mod context_menu;
 mod copy_mode;
+mod endpoint_agent_state;
+mod endpoint_agents;
+mod endpoint_navigation;
+mod endpoint_notices;
+mod endpoint_sidebar;
+mod endpoints;
+pub(super) use endpoints::*;
 mod global_menu;
 mod graphics;
 mod input;
+mod input_source;
+mod link_hover;
 mod mobile;
 mod mouse;
+mod notification_policy;
 mod notifications;
 mod overlay_input;
 mod preferences;
@@ -19,8 +33,13 @@ mod scroll;
 mod settings;
 mod state;
 mod surface_patch;
+mod text_editor;
+mod word_selection;
 mod worktrees;
+use text_editor::TextEditor;
+use word_selection::ClientWordSelection;
 
+pub(in crate::client::shell) use render::sidebar;
 pub(crate) use state::*;
 #[cfg(test)]
 pub(super) use surface_patch::apply_composed_surface_patch;
@@ -34,6 +53,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
+use super::endpoint::{ClientEndpointId, ClientEndpointStatus, SavedSshEndpoint};
 use crate::app::state::Palette;
 use crate::config::{
     Config, LiveKeybindConfig, SidebarCollapsedModeConfig, SpacesSidebarConfig,
@@ -46,30 +66,6 @@ use crate::protocol::{
 };
 #[cfg(test)]
 use crate::raw_input::RawInputEvent;
-
-fn delete_overlay_word(rename: &mut ClientRenameOverlay) {
-    if rename.replace_on_type {
-        rename.input.clear();
-        rename.replace_on_type = false;
-        return;
-    }
-    while rename.input.chars().last().is_some_and(char::is_whitespace) {
-        rename.input.pop();
-    }
-    let Some(word) = rename
-        .input
-        .chars()
-        .last()
-        .map(|character| character.is_alphanumeric() || character == '_')
-    else {
-        return;
-    };
-    while rename.input.chars().last().is_some_and(|character| {
-        !character.is_whitespace() && (character.is_alphanumeric() || character == '_') == word
-    }) {
-        rename.input.pop();
-    }
-}
 
 fn target_event_message(target: ClientInputTarget, event: ClientPaneInputEvent) -> ClientMessage {
     match target {

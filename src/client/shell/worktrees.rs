@@ -1,29 +1,41 @@
 use super::*;
 
+fn checkout_path_preview(root: &str, repo: &str, branch: &str) -> String {
+    // This is an endpoint path, not a path on the machine drawing the dialog.
+    let separator = if !root.starts_with('/') && root.contains('\\') {
+        '\\'
+    } else {
+        '/'
+    };
+    format!(
+        "{}{separator}{repo}{separator}{}",
+        root.trim_end_matches(separator),
+        crate::worktree::branch_to_path_slug(branch)
+    )
+}
+
 impl ClientShellState {
-    fn endpoint_worktree_directory(&self) -> Option<std::path::PathBuf> {
+    fn endpoint_worktree_directory(&self) -> Option<String> {
         self.snapshot
             .as_deref()
-            .map(|snapshot| std::path::PathBuf::from(&snapshot.worktree_directory))
+            .map(|snapshot| snapshot.worktree_directory.clone())
     }
 
     pub(super) fn insert_worktree_overlay_text(&mut self, text: &str) -> bool {
         match self.overlay.as_mut() {
             Some(ClientShellOverlay::WorktreeCreate(create)) if !create.creating => {
-                if create.replace_on_type {
-                    create.branch.clear();
-                    create.replace_on_type = false;
+                if create.branch.insert(text) {
+                    self.sync_worktree_create_path();
                 }
-                create.branch.push_str(text);
-                self.sync_worktree_create_path();
                 true
             }
             Some(ClientShellOverlay::WorktreeOpen(open))
                 if open.search_focused && !open.opening =>
             {
-                open.query.push_str(text);
-                if let Some(first) = open.filtered_indices().first().copied() {
-                    open.selected = first;
+                if open.query.insert(text) {
+                    if let Some(first) = open.filtered_indices().first().copied() {
+                        open.selected = first;
+                    }
                 }
                 true
             }
@@ -45,39 +57,24 @@ impl ClientShellState {
                         ClientWorktreeCreateOverlay { creating: true, .. }
                     ))
                 );
+                if !creating {
+                    if let Some(ClientShellOverlay::WorktreeCreate(create)) = self.overlay.as_mut()
+                    {
+                        if let Some(content_changed) = create.branch.handle_key(key) {
+                            if content_changed {
+                                self.sync_worktree_create_path();
+                            }
+                            outcome.repaint = true;
+                            return true;
+                        }
+                    }
+                }
                 match code {
                     KeyCode::Esc if !creating => {
                         self.overlay = None;
                         outcome.repaint = true;
                     }
                     KeyCode::Enter => self.submit_worktree_create(outcome),
-                    KeyCode::Backspace if !creating => {
-                        if let Some(ClientShellOverlay::WorktreeCreate(create)) =
-                            self.overlay.as_mut()
-                        {
-                            if create.replace_on_type {
-                                create.branch.clear();
-                                create.replace_on_type = false;
-                            } else {
-                                create.branch.pop();
-                            }
-                        }
-                        self.sync_worktree_create_path();
-                        outcome.repaint = true;
-                    }
-                    KeyCode::Char(character)
-                        if !creating
-                            && modifiers
-                                .difference(crossterm::event::KeyModifiers::SHIFT)
-                                .is_empty() =>
-                    {
-                        let text = key
-                            .generated_text
-                            .clone()
-                            .unwrap_or_else(|| character.to_string());
-                        self.insert_worktree_overlay_text(&text);
-                        outcome.repaint = true;
-                    }
                     _ => {}
                 }
                 true
@@ -98,6 +95,19 @@ impl ClientShellState {
                         }
                     ))
                 );
+                if !opening && search_focused {
+                    if let Some(ClientShellOverlay::WorktreeOpen(open)) = self.overlay.as_mut() {
+                        if let Some(content_changed) = open.query.handle_key(key) {
+                            if content_changed {
+                                if let Some(first) = open.filtered_indices().first().copied() {
+                                    open.selected = first;
+                                }
+                            }
+                            outcome.repaint = true;
+                            return true;
+                        }
+                    }
+                }
                 match code {
                     KeyCode::Esc if !opening => {
                         self.overlay = None;
@@ -112,35 +122,21 @@ impl ClientShellState {
                         self.move_worktree_open_selection(1);
                         outcome.repaint = true;
                     }
+                    KeyCode::Char('n' | 'p')
+                        if !opening && modifiers == crossterm::event::KeyModifiers::CONTROL =>
+                    {
+                        self.move_worktree_open_selection(if code == KeyCode::Char('n') {
+                            1
+                        } else {
+                            -1
+                        });
+                        outcome.repaint = true;
+                    }
                     KeyCode::Char('/') if !opening && !search_focused => {
                         if let Some(ClientShellOverlay::WorktreeOpen(open)) = self.overlay.as_mut()
                         {
                             open.search_focused = true;
                         }
-                        outcome.repaint = true;
-                    }
-                    KeyCode::Backspace if !opening && search_focused => {
-                        if let Some(ClientShellOverlay::WorktreeOpen(open)) = self.overlay.as_mut()
-                        {
-                            open.query.pop();
-                            if let Some(first) = open.filtered_indices().first().copied() {
-                                open.selected = first;
-                            }
-                        }
-                        outcome.repaint = true;
-                    }
-                    KeyCode::Char(character)
-                        if !opening
-                            && search_focused
-                            && modifiers
-                                .difference(crossterm::event::KeyModifiers::SHIFT)
-                                .is_empty() =>
-                    {
-                        let text = key
-                            .generated_text
-                            .clone()
-                            .unwrap_or_else(|| character.to_string());
-                        self.insert_worktree_overlay_text(&text);
                         outcome.repaint = true;
                     }
                     _ => {}
@@ -199,9 +195,8 @@ impl ClientShellState {
             .is_some_and(|worktree| worktree.is_linked_worktree);
         let kind = match action {
             KeybindAction::NewWorktree | KeybindAction::OpenWorktree if linked => {
-                self.endpoint_error = Some(
-                    "New and open worktree actions start from the repo parent workspace."
-                        .to_owned(),
+                self.set_endpoint_error(
+                    "New and open worktree actions start from the repo parent workspace.",
                 );
                 outcome.repaint = true;
                 return;
@@ -213,8 +208,7 @@ impl ClientShellState {
                 workspace_id: workspace_id.clone(),
             },
             KeybindAction::RemoveWorktree if !linked => {
-                self.endpoint_error =
-                    Some("This workspace is not a Herdr-managed worktree checkout.".to_owned());
+                self.set_endpoint_error("This workspace is not a Herdr-managed worktree checkout.");
                 outcome.repaint = true;
                 return;
             }
@@ -241,13 +235,8 @@ impl ClientShellState {
         let Some(ClientShellOverlay::WorktreeCreate(create)) = self.overlay.as_mut() else {
             return;
         };
-        create.checkout_path = crate::worktree::default_checkout_path(
-            &worktree_directory,
-            &create.repo_name,
-            &create.branch,
-        )
-        .display()
-        .to_string();
+        create.checkout_path =
+            checkout_path_preview(&worktree_directory, &create.repo_name, &create.branch);
         create.error = None;
     }
 
@@ -267,12 +256,9 @@ impl ClientShellState {
             outcome.repaint = true;
             return;
         }
-        create.branch = branch.clone();
-        create.replace_on_type = false;
+        create.branch.trim_and_accept();
         create.checkout_path =
-            crate::worktree::default_checkout_path(&worktree_directory, &create.repo_name, &branch)
-                .display()
-                .to_string();
+            checkout_path_preview(&worktree_directory, &create.repo_name, &branch);
         create.creating = true;
         create.error = None;
         let workspace_id = create.source_workspace_id.clone();
@@ -284,7 +270,7 @@ impl ClientShellState {
                 base: Some("HEAD".to_owned()),
                 path: None,
                 label: None,
-                focus: true,
+                focus: false,
                 trust_repository: false,
             }),
             PendingEndpointKind::WorktreeCreate,
@@ -383,6 +369,7 @@ impl ClientShellState {
         &mut self,
         kind: PendingEndpointKind,
         result: Result<crate::api::schema::ResponseResult, ClientShellEndpointError>,
+        outcome: &mut ClientShellInput,
     ) -> bool {
         use crate::api::schema::ResponseResult;
 
@@ -399,20 +386,14 @@ impl ClientShellState {
                 let Some(worktree_directory) = self.endpoint_worktree_directory() else {
                     return false;
                 };
-                let checkout_path = crate::worktree::default_checkout_path(
-                    &worktree_directory,
-                    &source.repo_name,
-                    &branch,
-                )
-                .display()
-                .to_string();
+                let checkout_path =
+                    checkout_path_preview(&worktree_directory, &source.repo_name, &branch);
                 self.overlay = Some(ClientShellOverlay::WorktreeCreate(
                     ClientWorktreeCreateOverlay {
                         source_workspace_id: workspace_id,
                         repo_name: source.repo_name,
-                        branch,
+                        branch: TextEditor::new(&branch, true),
                         checkout_path,
-                        replace_on_type: true,
                         error: None,
                         creating: false,
                     },
@@ -439,14 +420,14 @@ impl ClientShellState {
                     })
                     .collect::<Vec<_>>();
                 if entries.is_empty() {
-                    self.endpoint_error = Some("No Git worktrees found for this repo.".to_owned());
+                    self.set_endpoint_error("No Git worktrees found for this repo.");
                 } else {
                     self.overlay = Some(ClientShellOverlay::WorktreeOpen(
                         ClientWorktreeOpenOverlay {
                             source_workspace_id: workspace_id,
                             entries,
                             selected: 0,
-                            query: String::new(),
+                            query: TextEditor::default(),
                             search_focused: false,
                             error: None,
                             opening: false,
@@ -474,13 +455,26 @@ impl ClientShellState {
                         },
                     ));
                 } else {
-                    self.endpoint_error =
-                        Some("This workspace is not a Herdr-managed worktree checkout.".to_owned());
+                    self.set_endpoint_error(
+                        "This workspace is not a Herdr-managed worktree checkout.",
+                    );
                 }
                 true
             }
-            (PendingEndpointKind::WorktreeCreate, Ok(ResponseResult::WorktreeCreated { .. }))
-            | (PendingEndpointKind::WorktreeOpen, Ok(ResponseResult::WorktreeOpened { .. }))
+            (
+                PendingEndpointKind::WorktreeCreate,
+                Ok(ResponseResult::WorktreeCreated { tab, .. }),
+            ) => {
+                self.overlay = None;
+                self.push_endpoint_method(
+                    crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
+                        tab_id: tab.tab_id,
+                    }),
+                    outcome,
+                );
+                true
+            }
+            (PendingEndpointKind::WorktreeOpen, Ok(ResponseResult::WorktreeOpened { .. }))
             | (
                 PendingEndpointKind::WorktreeRemove { .. },
                 Ok(ResponseResult::WorktreeRemoved { .. }),
@@ -503,7 +497,9 @@ impl ClientShellState {
                 true
             }
             (PendingEndpointKind::WorktreeRemove { forced: false }, Err(error))
-                if error.code.as_deref() == Some("dirty_worktree_requires_force") =>
+                if error.code.as_deref() == Some("dirty_worktree_requires_force")
+                    || (error.code.as_deref() == Some("worktree_remove_failed")
+                        && crate::worktree::is_not_working_tree_remove_error(&error.message)) =>
             {
                 if let Some(ClientShellOverlay::WorktreeRemove(remove)) = self.overlay.as_mut() {
                     remove.removing = false;
@@ -526,8 +522,7 @@ impl ClientShellState {
                 Err(_),
             ) => true,
             (_, Ok(_)) => {
-                self.endpoint_error =
-                    Some("endpoint returned an unexpected worktree result".to_owned());
+                self.set_endpoint_error("endpoint returned an unexpected worktree result");
                 true
             }
             (
@@ -538,14 +533,36 @@ impl ClientShellState {
                 | PendingEndpointKind::ReloadConfig
                 | PendingEndpointKind::IntegrationList
                 | PendingEndpointKind::IntegrationInstall
-                | PendingEndpointKind::SelectionCopy { .. }
+                | PendingEndpointKind::SelectionCopy
                 | PendingEndpointKind::PaneScroll { .. }
                 | PendingEndpointKind::WordSelection { .. }
                 | PendingEndpointKind::PaneLinkActivate { .. }
+                | PendingEndpointKind::PaneLinkResolve { .. }
                 | PendingEndpointKind::CopyMotion { .. }
                 | PendingEndpointKind::CopySearch { .. },
                 Err(_),
             ) => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::checkout_path_preview;
+
+    #[test]
+    fn endpoint_path_style_is_independent_of_the_client_os() {
+        assert_eq!(
+            checkout_path_preview("/worktrees/", "repo", "feature/a"),
+            "/worktrees/repo/feature-a"
+        );
+        assert_eq!(
+            checkout_path_preview(r"C:\worktrees\", "repo", "feature/a"),
+            r"C:\worktrees\repo\feature-a"
+        );
+        assert_eq!(
+            checkout_path_preview(r"\\server\share", "repo", "feature/a"),
+            r"\\server\share\repo\feature-a"
+        );
     }
 }

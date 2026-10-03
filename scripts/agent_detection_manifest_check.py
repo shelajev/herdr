@@ -58,21 +58,13 @@ MAX_MATCHER_CHARS = 512
 # publishes the bundled Grok manifest.
 STAGED_PUBLISHED_MANIFESTS = {
     "grok": (
-        "2026.07.16.2",
-        "2026.07.16.1",
-        "1f35b3271a96cf830c64bed78751619bfd8013c277c0d7c0f999b7a433895f28",
+        "2026.09.18.2",
+        "2026.09.18.1",
+        "0f31b111144900b02f303577d27587f72d58d8c505185a682bd7887f822316ee",
     ),
 }
 
-# Muse is bundled on master but has not shipped in a stable binary yet. Stable
-# clients cannot identify it, so publish it with the release that first ships
-# the corresponding Agent variant and remove this exact-content exception.
-UNPUBLISHED_BUNDLED_MANIFESTS = {
-    "muse": (
-        "2026.08.26.1",
-        "b69c4d87fa9c19e3e6453b706fbe39c98a8b33ffbaa48e8cd5ae6751e9615074",
-    ),
-}
+UNPUBLISHED_BUNDLED_MANIFESTS: dict[str, tuple[str, str]] = {}
 
 
 def parse_args() -> argparse.Namespace:

@@ -2,6 +2,7 @@ use super::*;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 const SELECTION_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
+const SELECTION_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 impl ClientShellState {
     fn set_sidebar_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
@@ -122,8 +123,7 @@ impl ClientShellState {
             Ok(_) => {
                 self.pane_scroll_queued.remove(&pane_id);
                 self.pane_scroll_targets.remove(&pane_id);
-                self.endpoint_error =
-                    Some("endpoint returned an unexpected pane-scroll result".to_owned());
+                self.set_endpoint_error("endpoint returned an unexpected pane-scroll result");
                 true
             }
             Err(_) => {
@@ -161,14 +161,44 @@ impl ClientShellState {
         )
     }
 
+    fn active_selection_pane(&self) -> Option<PaneHit> {
+        let pane_id = if let Some(gesture) = self.word_selection_gesture.as_ref() {
+            if gesture.released {
+                return None;
+            }
+            &gesture.pane_id
+        } else {
+            &self
+                .selection
+                .as_ref()
+                .filter(|selection| selection.is_in_progress())?
+                .pane_id
+        };
+        self.hits
+            .panes
+            .iter()
+            .find(|hit| &hit.pane_id == pane_id)
+            .cloned()
+    }
+
     fn update_selection_cursor_with_metrics(
         &mut self,
         hit: &PaneHit,
         column: u16,
         row: u16,
         metrics: Option<crate::pane::ScrollMetrics>,
+        outcome: &mut ClientShellInput,
     ) {
-        if let Some(selection) = self.selection.as_mut() {
+        if self.word_selection_gesture.is_some() {
+            let viewport_row = row
+                .saturating_sub(hit.inner_rect.y)
+                .min(hit.inner_rect.height.saturating_sub(1));
+            let col = column
+                .saturating_sub(hit.inner_rect.x)
+                .min(hit.inner_rect.width.saturating_sub(1));
+            let absolute_row = crate::selection::absolute_row_for_viewport(viewport_row, metrics);
+            self.drag_word_selection((absolute_row, col), outcome);
+        } else if let Some(selection) = self.selection.as_mut() {
             selection.drag(column, row, hit.inner_rect, metrics);
         }
     }
@@ -189,8 +219,11 @@ impl ClientShellState {
             let (anchor_row, anchor_col) = selection.anchor_screen_pos(hit.inner_rect, metrics);
             anchor_row != row || anchor_col != column
         });
-        let is_dragging = was_dragging || moved_from_anchor;
-        self.update_selection_cursor_with_metrics(hit, column, row, metrics);
+        self.update_selection_cursor_with_metrics(hit, column, row, metrics, outcome);
+        let is_dragging = self
+            .word_selection_gesture
+            .as_ref()
+            .map_or(was_dragging || moved_from_anchor, |gesture| gesture.dragged);
         if is_dragging {
             if let Some(selection) = self.selection.as_mut() {
                 if selection.is_just_click() {
@@ -243,7 +276,7 @@ impl ClientShellState {
                 offset_from_bottom,
                 ..metrics
             };
-            self.update_selection_cursor_with_metrics(hit, column, row, Some(projected));
+            self.update_selection_cursor_with_metrics(hit, column, row, Some(projected), outcome);
             self.push_pane_scroll_offset(hit.pane_id.clone(), offset_from_bottom, outcome);
         }
         self.selection_autoscroll = Some(ClientSelectionAutoscroll {
@@ -267,20 +300,10 @@ impl ClientShellState {
         if !matches!(
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-        ) || !self
-            .selection
-            .as_ref()
-            .is_some_and(crate::selection::Selection::is_in_progress)
-        {
+        ) {
             return false;
         }
-        let Some(hit) = self.selection.as_ref().and_then(|selection| {
-            self.hits
-                .panes
-                .iter()
-                .find(|hit| hit.pane_id == selection.pane_id)
-                .cloned()
-        }) else {
+        let Some(hit) = self.active_selection_pane() else {
             return false;
         };
         let Some(metrics) = self.selection_scroll_metrics(&hit) else {
@@ -306,6 +329,7 @@ impl ClientShellState {
                 mouse.column,
                 mouse.row,
                 Some(projected),
+                outcome,
             );
             self.push_pane_scroll_offset(hit.pane_id, offset_from_bottom, outcome);
             outcome.repaint = true;
@@ -313,11 +337,26 @@ impl ClientShellState {
         true
     }
 
+    pub(super) fn request_selection_drag_repaint(&mut self, now: std::time::Instant) -> bool {
+        let deadline = self
+            .last_composed_at
+            .map(|last| last + SELECTION_REPAINT_INTERVAL);
+        self.selection_repaint_deadline = deadline.filter(|deadline| now < *deadline);
+        self.selection_repaint_deadline.is_none()
+    }
+
     pub(crate) fn tick_selection_autoscroll(
         &mut self,
         now: std::time::Instant,
     ) -> ClientShellInput {
         let mut outcome = ClientShellInput::default();
+        if self
+            .selection_repaint_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.selection_repaint_deadline = None;
+            outcome.repaint = true;
+        }
         if self
             .selection_autoscroll_deadline
             .is_none_or(|deadline| now < deadline)
@@ -328,9 +367,15 @@ impl ClientShellState {
             self.selection_autoscroll_deadline = None;
             return outcome;
         };
-        if !self.selection.as_ref().is_some_and(|selection| {
-            selection.pane_id == autoscroll.pane_id && selection.is_dragging()
-        }) {
+        let dragging = self.word_selection_gesture.as_ref().map_or_else(
+            || {
+                self.selection.as_ref().is_some_and(|selection| {
+                    selection.pane_id == autoscroll.pane_id && selection.is_dragging()
+                })
+            },
+            |gesture| gesture.pane_id == autoscroll.pane_id && gesture.dragged && !gesture.released,
+        );
+        if !dragging {
             self.stop_selection_autoscroll();
             return outcome;
         }
@@ -372,6 +417,7 @@ impl ClientShellState {
             autoscroll.last_mouse_column,
             autoscroll.last_mouse_row,
             Some(metrics),
+            &mut outcome,
         );
         self.push_pane_scroll_offset(autoscroll.pane_id.clone(), next_offset, &mut outcome);
         self.selection_autoscroll = Some(autoscroll);
@@ -466,19 +512,44 @@ impl ClientShellState {
         if self.hits.workspace_body.height == 0
             || point.1 < self.hits.workspace_body.y.saturating_sub(1)
             || point.1 >= self.hits.new_workspace.y
+            || self.hits.workspaces.iter().any(|hit| {
+                hit.endpoint_id != self.active_endpoint_id && super::contains(hit.rect, point)
+            })
         {
             return None;
         }
+        let snapshot = self.snapshot.as_deref()?;
         let mut slots = self
             .hits
             .workspaces
             .iter()
-            .filter(|hit| !hit.indented)
+            .filter(|hit| hit.endpoint_id == self.active_endpoint_id && !hit.indented)
+            .filter(|hit| {
+                hit.group_toggle.as_ref().is_none_or(|(_, key)| {
+                    snapshot
+                        .workspaces
+                        .iter()
+                        .find(|workspace| {
+                            workspace.worktree.as_ref().is_some_and(|worktree| {
+                                worktree.key == *key && !worktree.is_linked_worktree
+                            })
+                        })
+                        .is_some_and(|workspace| workspace.workspace_id == hit.workspace_id)
+                })
+            })
             .map(|hit| (Some(hit.workspace_id.clone()), hit.rect.y.saturating_sub(1)))
             .collect::<Vec<_>>();
-        let snapshot = self.snapshot.as_deref()?;
-        let entries = render::workspace_entries(snapshot, &self.collapsed_groups);
-        let last_hit = self.hits.workspaces.last()?;
+        let empty_collapsed_groups = HashSet::new();
+        let collapsed_groups = self
+            .collapsed_groups_for_endpoint(&self.active_endpoint_id)
+            .unwrap_or(&empty_collapsed_groups);
+        let entries = render::workspace_entries(snapshot, collapsed_groups);
+        let last_hit = self
+            .hits
+            .workspaces
+            .iter()
+            .rev()
+            .find(|hit| hit.endpoint_id == self.active_endpoint_id)?;
         let last_position = entries.iter().position(|entry| {
             snapshot
                 .workspaces
@@ -486,7 +557,15 @@ impl ClientShellState {
                 .is_some_and(|workspace| workspace.workspace_id == last_hit.workspace_id)
         })?;
         let next = entries.get(last_position + 1);
-        if !next.is_some_and(|entry| entry.indented) {
+        if !next.is_some_and(|entry| {
+            entry.indented
+                || last_hit.group_toggle.as_ref().is_some_and(|(_, key)| {
+                    snapshot.workspaces[entry.index]
+                        .worktree
+                        .as_ref()
+                        .is_some_and(|worktree| worktree.key == *key)
+                })
+        }) {
             let before = next.and_then(|entry| {
                 snapshot
                     .workspaces
@@ -549,7 +628,7 @@ impl ClientShellState {
                 .position(|workspace| workspace.workspace_id == target)?,
             None => remaining.len(),
         };
-        if insert_position == source_position {
+        if source.worktree.is_none() && insert_position == source_position {
             return None;
         }
 
@@ -568,7 +647,11 @@ impl ClientShellState {
                         })
                         .map(|workspace| workspace.workspace_id.clone()),
                 )
-                .collect();
+                .collect::<Vec<_>>();
+            if before_workspace_id.is_some_and(|target| workspace_ids.iter().any(|id| id == target))
+            {
+                return None;
+            }
             Some(crate::api::schema::Method::WorkspaceMoveBlock(
                 crate::api::schema::WorkspaceMoveBlockParams {
                     workspace_ids,
@@ -594,7 +677,18 @@ impl ClientShellState {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) {
+        self.update_link_hover(mouse, outcome);
         let point = (mouse.column, mouse.row);
+        if self.mode == ClientShellMode::Navigate
+            && self.workspace_preview_action_blocked()
+            && self.overlay.is_none()
+            && !self.mobile_layout_active()
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        {
+            self.mode = self.copy_or_terminal_mode();
+            self.navigate_workspace_id = None;
+            outcome.repaint = true;
+        }
         if matches!(self.overlay, Some(ClientShellOverlay::Onboarding)) {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left)
                 && super::contains(self.hits.overlay_primary, point)
@@ -963,6 +1057,22 @@ impl ClientShellState {
                     }
                     return;
                 }
+                Some(ClientChromeDrag::NavigatorScrollbar { grab_row_offset }) => {
+                    if let Some(metrics) = self.hits.navigator_scroll_metrics {
+                        let offset = crate::ui::scrollbar_offset_from_drag_row(
+                            metrics,
+                            self.hits.navigator_scrollbar,
+                            mouse.row,
+                            *grab_row_offset,
+                        );
+                        self.scroll_navigator_to(
+                            metrics.max_offset_from_bottom.saturating_sub(offset),
+                            metrics.viewport_rows,
+                        );
+                        outcome.repaint = true;
+                    }
+                    return;
+                }
                 Some(ClientChromeDrag::HelpScrollbar { grab_row_offset }) => {
                     if let (Some(metrics), Some(ClientShellOverlay::Help(help))) =
                         (self.hits.help_scroll_metrics, self.overlay.as_mut())
@@ -1109,21 +1219,7 @@ impl ClientShellState {
                     .max(mouse.row.abs_diff(press.start_row));
                 if delta >= 1 {
                     let source_workspace_id = press.workspace_id.clone();
-                    let draggable = self
-                        .snapshot
-                        .as_deref()
-                        .and_then(|snapshot| {
-                            snapshot
-                                .workspaces
-                                .iter()
-                                .find(|workspace| workspace.workspace_id == source_workspace_id)
-                        })
-                        .is_some_and(|workspace| {
-                            !workspace
-                                .worktree
-                                .as_ref()
-                                .is_some_and(|worktree| worktree.is_linked_worktree)
-                        });
+                    let draggable = self.endpoint_workspace_is_draggable(press);
                     if draggable {
                         if let Some(target) = self.workspace_drop_target_at(point) {
                             self.chrome_drag = Some(ClientChromeDrag::Workspace {
@@ -1262,20 +1358,14 @@ impl ClientShellState {
                     ClientChromeDrag::WorkspaceScrollbar { .. }
                     | ClientChromeDrag::AgentScrollbar { .. }
                     | ClientChromeDrag::HelpScrollbar { .. }
+                    | ClientChromeDrag::NavigatorScrollbar { .. }
                     | ClientChromeDrag::ProductAnnouncementScrollbar { .. }
                     | ClientChromeDrag::ReleaseNotesScrollbar { .. } => {}
                 }
                 return;
             }
             if let Some(press) = self.workspace_press.take() {
-                self.push_endpoint_method(
-                    crate::api::schema::Method::WorkspaceFocus(
-                        crate::api::schema::WorkspaceTarget {
-                            workspace_id: press.workspace_id,
-                        },
-                    ),
-                    outcome,
-                );
+                self.finish_endpoint_workspace_press(press, outcome);
                 return;
             }
             if let Some(press) = self.tab_press.take() {
@@ -1552,20 +1642,42 @@ impl ClientShellState {
                 .navigator_rows
                 .iter()
                 .find(|(rect, _)| super::contains(*rect, point))
-                .copied();
+                .cloned();
             match mouse.kind {
                 MouseEventKind::Moved => {
-                    if let Some((_, index)) = row_hit {
+                    if let Some((_, target)) = row_hit {
                         if let Some(ClientShellOverlay::Navigator(navigator)) =
                             self.overlay.as_mut()
                         {
-                            navigator.selected = index;
+                            navigator.selected = Some(target);
                         }
                         outcome.repaint = true;
                     }
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if super::contains(self.hits.navigator_search, point) {
+                    if super::contains(self.hits.navigator_scrollbar, point) {
+                        if let Some(metrics) = self.hits.navigator_scroll_metrics {
+                            if let Some(grab_row_offset) = crate::ui::scrollbar_thumb_grab_offset(
+                                metrics,
+                                self.hits.navigator_scrollbar,
+                                mouse.row,
+                            ) {
+                                self.chrome_drag =
+                                    Some(ClientChromeDrag::NavigatorScrollbar { grab_row_offset });
+                            } else {
+                                let offset = crate::ui::scrollbar_offset_from_row(
+                                    metrics,
+                                    self.hits.navigator_scrollbar,
+                                    mouse.row,
+                                );
+                                self.scroll_navigator_to(
+                                    metrics.max_offset_from_bottom.saturating_sub(offset),
+                                    metrics.viewport_rows,
+                                );
+                                outcome.repaint = true;
+                            }
+                        }
+                    } else if super::contains(self.hits.navigator_search, point) {
                         if let Some(ClientShellOverlay::Navigator(navigator)) =
                             self.overlay.as_mut()
                         {
@@ -1573,36 +1685,13 @@ impl ClientShellState {
                             navigator.filter = None;
                         }
                         outcome.repaint = true;
-                    } else if let Some((rect, index)) = row_hit {
+                    } else if let Some((_, target)) = row_hit {
                         if let Some(ClientShellOverlay::Navigator(navigator)) =
                             self.overlay.as_mut()
                         {
-                            navigator.selected = index;
+                            navigator.selected = Some(target);
                         }
-                        let workspace = self
-                            .snapshot
-                            .as_deref()
-                            .zip(self.overlay.as_ref())
-                            .and_then(|(snapshot, overlay)| match overlay {
-                                ClientShellOverlay::Navigator(navigator) => {
-                                    render::client_navigator_rows(snapshot, navigator)
-                                        .get(index)
-                                        .map(|row| {
-                                            matches!(
-                                                row.target,
-                                                ClientNavigatorTarget::Workspace(_)
-                                            )
-                                        })
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or(false);
-                        if workspace && mouse.column <= rect.x.saturating_add(3) {
-                            self.toggle_selected_navigator_workspace();
-                            outcome.repaint = true;
-                        } else {
-                            self.accept_navigator_selection(outcome);
-                        }
+                        self.accept_navigator_selection(outcome);
                     } else if !super::contains(self.hits.navigator_popup, point) {
                         self.overlay = None;
                         outcome.repaint = true;
@@ -1628,27 +1717,13 @@ impl ClientShellState {
                 match self.overlay.as_ref() {
                     Some(ClientShellOverlay::Rename(_)) => self.save_rename_overlay(outcome),
                     Some(ClientShellOverlay::ConfirmClose(_)) => {
-                        let Some(ClientShellOverlay::ConfirmClose(confirm)) = self.overlay.take()
-                        else {
-                            return;
-                        };
-                        self.push_endpoint_method(
-                            crate::api::schema::Method::WorkspaceClose(
-                                crate::api::schema::WorkspaceCloseParams {
-                                    workspace_id: confirm.workspace_id,
-                                    close_group: true,
-                                },
-                            ),
-                            outcome,
-                        );
-                        outcome.repaint = true;
+                        self.accept_close_confirmation(outcome);
                     }
                     _ => {}
                 }
             } else if super::contains(self.hits.overlay_clear, point) {
                 if let Some(ClientShellOverlay::Rename(rename)) = self.overlay.as_mut() {
                     rename.input.clear();
-                    rename.replace_on_type = false;
                     outcome.repaint = true;
                 }
             } else {
@@ -1659,18 +1734,21 @@ impl ClientShellState {
         }
 
         if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
-            let selection_hit = self.selection.as_ref().and_then(|selection| {
-                self.hits
-                    .panes
-                    .iter()
-                    .find(|hit| hit.pane_id == selection.pane_id)
-                    .cloned()
-            });
+            let selection_hit = self.active_selection_pane();
             if let Some(hit) = selection_hit {
                 self.update_selection_drag(&hit, mouse.column, mouse.row, outcome);
-                outcome.repaint = true;
+                // Consume every motion, but do not rebuild a frame for every intermediate position.
+                outcome.repaint |= !outcome.actions.is_empty()
+                    || self.request_selection_drag_repaint(std::time::Instant::now());
                 return;
             }
+        }
+        if mouse.kind == MouseEventKind::Up(MouseButton::Left)
+            && self.word_selection_gesture.is_some()
+        {
+            self.finish_word_selection(outcome);
+            outcome.repaint = true;
+            return;
         }
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) && self.selection.is_some() {
             self.stop_selection_autoscroll();
@@ -1679,9 +1757,13 @@ impl ClientShellState {
                 .as_mut()
                 .is_some_and(crate::selection::Selection::finish);
             if copied && self.config.copy_on_select {
-                self.request_selection_copy(outcome);
+                self.request_selection_copy(outcome, true);
                 self.selection = None;
-            } else if !copied {
+            } else if self
+                .selection
+                .as_ref()
+                .is_some_and(crate::selection::Selection::is_just_click)
+            {
                 self.selection = None;
             }
             if copied {
@@ -1749,13 +1831,7 @@ impl ClientShellState {
                     return;
                 }
                 let workspace_id = (!self.sidebar_collapsed)
-                    .then(|| {
-                        self.hits
-                            .workspaces
-                            .iter()
-                            .find(|hit| super::contains(hit.rect, point))
-                            .map(|hit| hit.workspace_id.clone())
-                    })
+                    .then(|| self.active_endpoint_workspace_at(point))
                     .flatten();
                 if let Some(workspace_id) = workspace_id {
                     self.open_workspace_context_menu(workspace_id, mouse.column, mouse.row);
@@ -1854,7 +1930,7 @@ impl ClientShellState {
                 }
                 self.stop_selection_autoscroll();
                 self.selection_highlight_clear_deadline = None;
-                self.pending_word_selection = None;
+                self.word_selection_gesture = None;
                 let previous_pane_click = self.last_pane_click.take();
                 self.workspace_press = None;
                 self.tab_press = None;
@@ -1949,6 +2025,9 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                if self.handle_endpoint_machine_click(point, outcome) {
+                    return;
+                }
                 if super::contains(self.hits.global_launcher, point) {
                     self.toggle_global_menu();
                     outcome.repaint = true;
@@ -2005,17 +2084,15 @@ impl ClientShellState {
                     self.persist_chrome_preferences(outcome);
                     return;
                 }
-                for hit in &self.hits.workspaces {
-                    if let Some((rect, key)) = &hit.group_toggle {
-                        if super::contains(*rect, point) {
-                            if !self.collapsed_groups.remove(key) {
-                                self.collapsed_groups.insert(key.clone());
-                            }
-                            outcome.repaint = true;
-                            self.persist_chrome_preferences(outcome);
-                            return;
-                        }
-                    }
+                let group_toggle = self.hits.workspaces.iter().find_map(|hit| {
+                    let (rect, key) = hit.group_toggle.as_ref()?;
+                    super::contains(*rect, point).then(|| (hit.endpoint_id.clone(), key.clone()))
+                });
+                if let Some((endpoint_id, key)) = group_toggle {
+                    self.toggle_collapsed_group(&endpoint_id, key);
+                    outcome.repaint = true;
+                    self.persist_chrome_preferences(outcome);
+                    return;
                 }
                 let workspace_press = self
                     .hits
@@ -2023,6 +2100,7 @@ impl ClientShellState {
                     .iter()
                     .find(|hit| super::contains(hit.rect, point))
                     .map(|hit| ClientWorkspacePress {
+                        endpoint_id: hit.endpoint_id.clone(),
                         workspace_id: hit.workspace_id.clone(),
                         start_column: mouse.column,
                         start_row: mouse.row,
@@ -2057,6 +2135,9 @@ impl ClientShellState {
                     .flatten();
                 if let Some(tab_press) = tab_press {
                     self.tab_press = Some(tab_press);
+                    return;
+                }
+                if self.handle_endpoint_agent_click(point, outcome) {
                     return;
                 }
                 let agent_pane_id = self
