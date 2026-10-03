@@ -22,6 +22,12 @@ const READY_POLL_ATTEMPTS: u32 = 36;
 const READY_POLL_DELAY: Duration = Duration::from_secs(5);
 const AGENT_START_TIMEOUT_MS: u64 = 240_000;
 const WATCH_POLL_DELAY: Duration = Duration::from_secs(20);
+/// Where the kit mounts the reviewed project inside the sandbox.
+const DEFAULT_WORKSPACE_DIR: &str = "/home/agent/workspace";
+/// `herdr task watch` exit code for a run that reported DONE without evidence
+/// that an independent reviewer accepted its current commit. Distinct from
+/// BLOCKED (3) so automation can tell "needs resources" from "not reviewed".
+const EXIT_UNACCEPTED: i32 = 4;
 
 pub(super) fn run_task_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -159,6 +165,128 @@ fn read_crew_file(host: &str, name: &str) -> std::io::Result<Option<String>> {
         Ok(None)
     } else {
         Ok(Some(content))
+    }
+}
+
+/// Marker the remote prints when an evidence file does not exist, so an absent
+/// file is distinguishable from an unreadable sandbox.
+const NO_SUCH_CREW_FILE: &str = "__herdr_no_such_crew_file__";
+
+/// Read a crew file for acceptance purposes.
+///
+/// `read_crew_file` swallows transport failures, which is right for tailing a
+/// status file and wrong for deciding whether work is done: a broken SSH
+/// connection must not read as "the crew produced no QC report". The outer
+/// `Err` is a transport failure, `Ok(None)` is a genuinely absent file.
+fn read_evidence_file(host: &str, name: &str) -> std::io::Result<Result<Option<String>, String>> {
+    let path = shell_quote(&format!("{CREW_DIR}/{name}"));
+    let remote =
+        format!("if [ -r {path} ]; then cat {path}; else printf %s {NO_SUCH_CREW_FILE}; fi");
+    let output = ssh_capture(host, &remote)?;
+    if output.exit_code != 0 {
+        return Ok(Err(format!(
+            "could not read {CREW_DIR}/{name} from {host} (exit {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        )));
+    }
+    if output.stdout.trim() == NO_SUCH_CREW_FILE {
+        return Ok(Ok(None));
+    }
+    Ok(Ok(Some(output.stdout)))
+}
+
+/// Write one crew file from the host, replacing any previous content.
+fn write_crew_file(host: &str, name: &str, content: &str) -> std::io::Result<Result<(), String>> {
+    let path = shell_quote(&format!("{CREW_DIR}/{name}"));
+    // The heredoc body is data, never shell: 'EOF' is quoted so nothing in the
+    // content is expanded, and the content itself is never interpolated into
+    // the command line.
+    let remote = format!("cat > {path} <<'HERDR_EOF'\n{content}\nHERDR_EOF\n");
+    let output = ssh_capture(host, &remote)?;
+    if output.exit_code != 0 {
+        return Ok(Err(format!(
+            "could not write {CREW_DIR}/{name} on {host} (exit {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        )));
+    }
+    Ok(Ok(()))
+}
+
+/// Remove a crew file, ignoring an already-absent one.
+fn remove_crew_file(host: &str, name: &str) -> std::io::Result<()> {
+    let path = shell_quote(&format!("{CREW_DIR}/{name}"));
+    let _ = ssh_capture(host, &format!("rm -f {path}"))?;
+    Ok(())
+}
+
+/// Run a git command in the sandboxed workspace and capture stdout.
+fn remote_git(host: &str, workdir: &str, args: &[&str]) -> std::io::Result<Result<String, String>> {
+    let mut argv = vec!["git", "-C", workdir];
+    argv.extend_from_slice(args);
+    let remote = tasks::remote_command(&argv);
+    let output = ssh_capture(host, &remote)?;
+    if output.exit_code != 0 {
+        return Ok(Err(format!(
+            "remote `{remote}` failed (exit {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        )));
+    }
+    Ok(Ok(output.stdout))
+}
+
+/// Decide whether a `RESULT: DONE` may be accepted for this run.
+///
+/// The run id and the workspace HEAD are read both before and after the QC
+/// report, so a crew that commits or edits while the host is mid-poll fails
+/// instead of slipping a stale report through. Any unreadable input is a
+/// refusal, never an acceptance.
+fn accept_completed_run(
+    host: &str,
+    workdir: &str,
+    roles: &RoleAssignment,
+) -> std::io::Result<Result<tasks::QcEvidence, String>> {
+    macro_rules! bail {
+        ($value:expr) => {
+            match $value {
+                Ok(value) => value,
+                Err(err) => return Ok(Err(err)),
+            }
+        };
+    }
+
+    let run_before = bail!(read_evidence_file(host, tasks::RUN_METADATA_FILE)?);
+    let head_before = bail!(remote_git(host, workdir, &["rev-parse", "HEAD"])?);
+    let qc = bail!(read_evidence_file(host, tasks::QC_EVIDENCE_FILE)?);
+    let porcelain = bail!(remote_git(host, workdir, &["status", "--porcelain"])?);
+    let head_after = bail!(remote_git(host, workdir, &["rev-parse", "HEAD"])?);
+    let run_after = bail!(read_evidence_file(host, tasks::RUN_METADATA_FILE)?);
+
+    if head_before.trim() != head_after.trim() {
+        return Ok(Err(format!(
+            "the workspace moved from {} to {} while its QC evidence was being read; \
+             a new QC round is required",
+            head_before.trim(),
+            head_after.trim()
+        )));
+    }
+    if run_before != run_after {
+        return Ok(Err(
+            "a new run started while its QC evidence was being read".to_string(),
+        ));
+    }
+
+    match tasks::accept_run(
+        roles,
+        run_before.as_deref(),
+        qc.as_deref(),
+        head_before.trim(),
+        &porcelain,
+    ) {
+        Ok(evidence) => Ok(Ok(evidence)),
+        Err(err) => Ok(Err(err.to_string())),
     }
 }
 
@@ -363,7 +491,7 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
     };
     let workdir = read_crew_file(&host, "workdir")?
         .map(|content| content.trim().to_string())
-        .unwrap_or_else(|| "/home/agent/workspace".to_string());
+        .unwrap_or_else(|| DEFAULT_WORKSPACE_DIR.to_string());
 
     println!(
         "task {slug}: orchestrator={} planner={} implementer={} qc={} (workspace {workdir})",
@@ -375,6 +503,18 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
     if let Err(err) = ensure_agent(&host, "orchestrator", &roles, &workdir) {
         eprintln!("failed to start the orchestrator: {err}");
         eprintln!("inspect with: herdr task attach {slug}");
+        return Ok(1);
+    }
+
+    // Mint this run's identity before the goal is delivered. The QC report must
+    // name this run id and this run's goal, so a report left behind by an
+    // earlier run can never be mistaken for acceptance of this one. Discarding
+    // any previous report is part of the same step: evidence describes one
+    // reviewed commit of one run, and it is invalid the moment a new run opens.
+    let run = tasks::new_run_metadata(&goal, &workdir);
+    remove_crew_file(&host, tasks::QC_EVIDENCE_FILE)?;
+    if let Err(err) = write_crew_file(&host, tasks::RUN_METADATA_FILE, &run.to_json())? {
+        eprintln!("failed to record this run's identity: {err}");
         return Ok(1);
     }
 
@@ -422,7 +562,7 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
         println!("follow progress with: herdr task watch {slug}");
         return Ok(0);
     }
-    watch_task(&slug, &host)
+    watch_task(&slug, &host, &workdir, &roles)
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +578,18 @@ fn task_watch(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{err}");
         return Ok(2);
     }
-    watch_task(slug, &ssh_host(slug))
+    let host = ssh_host(slug);
+    let workdir = read_crew_file(&host, "workdir")?
+        .map(|content| content.trim().to_string())
+        .unwrap_or_else(|| DEFAULT_WORKSPACE_DIR.to_string());
+    let Some(roles) = crew_assignment(&host)? else {
+        eprintln!(
+            "cannot read the crew assignment from {host}; without it there is no configured \
+             reviewer to check a completion report against"
+        );
+        return Ok(1);
+    };
+    watch_task(slug, &host, &workdir, &roles)
 }
 
 /// Print what changed in a crew file since the previous poll. Content-based
@@ -460,7 +611,12 @@ fn print_file_delta(prefix: &str, previous: &str, current: &str) -> bool {
     true
 }
 
-fn watch_task(slug: &str, host: &str) -> std::io::Result<i32> {
+fn watch_task(
+    slug: &str,
+    host: &str,
+    workdir: &str,
+    roles: &RoleAssignment,
+) -> std::io::Result<i32> {
     println!("watching task {slug} (Ctrl-C to stop; the crew keeps working)...");
     let mut last_status = String::new();
     let mut last_escalations = String::new();
@@ -516,8 +672,29 @@ fn watch_task(slug: &str, host: &str) -> std::io::Result<i32> {
 
         match parse_result(tasks::current_run_slice(&last_status)) {
             Some(TaskResult::Done) => {
-                println!("task {slug}: RESULT: DONE — review with: herdr task attach {slug}");
-                return Ok(0);
+                // `RESULT: DONE` is prose an agent wrote about itself. It opens
+                // the acceptance check; it does not pass it.
+                match accept_completed_run(host, workdir, roles)? {
+                    Ok(evidence) => {
+                        println!(
+                            "task {slug}: RESULT: DONE — accepted at {} (qc {}, implementer {})",
+                            evidence.commit, evidence.qc, evidence.implementer
+                        );
+                        for check in &evidence.checks {
+                            println!("  check | {} | {}", check.name, check.command);
+                        }
+                        println!("review with: herdr task attach {slug}");
+                        return Ok(0);
+                    }
+                    Err(err) => {
+                        eprintln!("task {slug}: RESULT: DONE, but it is NOT accepted: {err}");
+                        eprintln!(
+                            "the sandbox commit is not reviewed work; inspect it with \
+                             `herdr task attach {slug}` before trusting it"
+                        );
+                        return Ok(EXIT_UNACCEPTED);
+                    }
+                }
             }
             Some(TaskResult::Failed) => {
                 eprintln!("task {slug}: RESULT: FAILED — inspect with: herdr task attach {slug}");

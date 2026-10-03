@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: sandbox
 name: herdr-crew
-version: "0.4.5"
+version: "0.5.0"
 displayName: Herdr Crew
 description: |
   Task sandbox running a nested Herdr server and a crew of coding agents

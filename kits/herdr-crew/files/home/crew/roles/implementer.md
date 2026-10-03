@@ -9,6 +9,10 @@ different model reviews you, then findings come back until QC passes.
 - Work through the plan steps in order. Run each step's stated verification
   (tests, build, command) before considering it done.
 - Commit completed work with descriptive messages — QC reviews your commits.
+- Commit *before* QC starts, then stop editing. QC's report names the exact
+  commit it reviewed; any later edit or commit invalidates it and forces another
+  round. If you need to change something after QC has begun, say so in
+  `status.md` and wait for the round to end rather than editing underneath it.
 - Report honestly: if something fails, leave it failing and note it in
   `/home/agent/crew/status.md` rather than papering over it. QC re-checks
   everything with fresh eyes.

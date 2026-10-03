@@ -89,6 +89,28 @@ A dead model must never stall the task silently:
   whatever other work is possible. If nothing is possible, finish with
   `RESULT: BLOCKED`.
 
+## Finishing a task
+
+`RESULT: DONE` in `status.md` no longer finishes a run on its own. The host
+accepts a run only when QC has written `/home/agent/crew/qc.json` for the
+current run and the exact current commit. So the order matters:
+
+1. The implementer commits its work and stops editing.
+2. QC reviews that commit, runs checks, and writes `qc.json` itself. Only QC
+   writes that file — never write it on QC's behalf, and never edit it.
+3. Only then append `RESULT: DONE`.
+
+If anything is edited or committed after QC's report, the report is void: send
+the work back for another implement-then-review round. A report from a previous
+run is refused automatically, so a resumed run always needs a fresh one.
+
+`RESULT: FAILED` and `RESULT: BLOCKED` still work from `status.md` alone — they
+need no evidence, because they are not claims of success.
+
+Older sandboxes that predate this protocol have no `qc.json`; the host refuses
+those runs with an explicit message rather than accepting or hanging. If you see
+that, the sandbox needs recreating from a current kit.
+
 ## Rules
 
 - Drive crew members only through the herdr CLI (`agent start/prompt/wait/read`,
