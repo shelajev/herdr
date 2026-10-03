@@ -65,7 +65,7 @@ cargo build --release                        # host herdr with the task commands
 ```
 
 The kit is published as `docker.io/olegselajev241/herdr-crew-kit:latest`
-(also `:0.2.0`) — the CLI's default — so no local kit reference is needed.
+(also `:0.4.4`) — the CLI's default — so no local kit reference is needed.
 When iterating on the kit itself, point `HERDR_TASK_KIT` (or `--kit`) at
 `./kits/herdr-crew/` and republish with
 `sbx kit push ./kits/herdr-crew docker.io/olegselajev241/herdr-crew-kit:latest`.
@@ -86,8 +86,13 @@ herdr task attach fix-login               # live TUI view of the whole crew
 herdr task rm fix-login
 ```
 
+Task creation always passes `--skills off`: no host shared skill store is
+mounted. Crew-installed skills stay in the sandbox unless explicitly installed
+into the mounted project. Use a standalone clone: linked worktrees whose Git
+metadata lives outside the mount are rejected.
+
 The workspace directory mounts into the sandbox at the same absolute path;
-commits land in it directly — use a dedicated clone or worktree per task.
+commits land in it directly — use a dedicated standalone clone per task.
 
 Mixins install as root inside the sandbox, so treat a mixin reference as code
 you're choosing to run. sbx's kit-source allowlist defaults to `docker.io/`;
@@ -105,6 +110,15 @@ sbx settings set kit.allowedSources '["docker.io/","github.com/shelajev/"]'
 - Rotation is deterministic from the slug (18 assignments: 6 crew
   permutations x 3 orchestrator choices), reproducible per slug, varied
   across slugs to balance subscription usage.
+
+## Unattended startup
+
+The host probes a real `herdr agent list` request and creates the first workspace
+before starting the orchestrator. Its recovery server starts in a separate Linux
+session so SSH cleanup cannot terminate the server process group. Kit startup
+supervises the server independently of an interactive attachment. Codex startup
+update checks are disabled; update crew CLI versions through template maintenance.
+`task status` shows blocked-agent screens and server logs when diagnosis is needed.
 
 ## Known limitations (v0)
 

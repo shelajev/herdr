@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: sandbox
 name: herdr-crew
-version: "0.4.1"
+version: "0.4.5"
 displayName: Herdr Crew
 description: |
   Task sandbox running a nested Herdr server and a crew of coding agents
@@ -139,6 +139,8 @@ permissions:
       - files.openai.com
       - codeload.github.com
       - generativelanguage.googleapis.com
+      # Official runtime docs and current agent detection manifests.
+      - herdr.dev
       # Source and packages for the actual task work.
       - github.com
       - api.github.com
@@ -214,6 +216,7 @@ setup:
         approval_policy = "never"
         sandbox_mode = "danger-full-access"
         mcp_oauth_credentials_store = "file"
+        check_for_update_on_startup = false
         EOF
         case "$MODE" in
           oauth|apikey)
@@ -249,12 +252,11 @@ setup:
   startup:
     # The sandbox entrypoint (crew-entry) only runs when someone attaches, so
     # a detached task sandbox needs the herdr server started as a boot
-    # service. Startup commands run on every sandbox start; the pgrep guard
-    # keeps this idempotent.
+    # service. A real server request keeps repeated startup idempotent.
     - command:
         - sh
         - -c
-        - pgrep -f 'herdr server' >/dev/null 2>&1 || exec herdr server >>/tmp/herdr-server.log 2>&1
+        - export PATH="/home/agent/.local/bin:$PATH"; while true; do herdr agent list >/dev/null 2>&1 || herdr server >>/tmp/herdr-server.log 2>&1; sleep 5; done
       user: "agent"
       background: true
       description: Keep the headless herdr server running in detached sandboxes

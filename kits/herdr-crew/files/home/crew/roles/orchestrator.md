@@ -20,6 +20,9 @@ the goal and arbitrates resources; everything else is yours.
    herdr agent start planner --kind codex --pane <pane-id> --timeout 240000
    ```
 
+   For a `codex` role, suppress the interactive updater (the crew template
+   owns CLI updates): append `-- -c check_for_update_on_startup=false`.
+
    For a `pi` role (the Google-models member), pin the crew model:
    `herdr agent start qc --kind pi --pane <pane-id> --timeout 240000 -- --provider google --model "$HERDR_CREW_GEMINI_MODEL"`.
 

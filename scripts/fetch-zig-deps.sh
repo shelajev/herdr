@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Side-load libghostty-vt's Zig package dependencies into Zig's global cache.
 #
-# Zig 0.15's HTTP client receives `400 Bad Request` from deps.files.ghostty.org
+# Zig's HTTP client receives `400 Bad Request` from deps.files.ghostty.org
 # (curl fetches the same URLs fine), which breaks `cargo build` at the vendored
 # `zig build` step. Zig verifies packages by content hash from build.zig.zon,
 # so the transport doesn't matter: this script downloads each dependency with
@@ -53,10 +53,12 @@ fetch_one() {
       ;;
   esac
   # zig fetch infers the archive format from the file extension, so keep the
-  # URL's basename.
+  # URL's basename. Zig 0.16's `zig fetch` resolves the project before the
+  # package, so it must run from a directory containing build.zig even when the
+  # argument is an absolute path.
   local file="$tmp_dir/$(basename "$url")"
   if curl -fsSL "$url" -o "$file"; then
-    if zig fetch "$file" >/dev/null 2>&1; then
+    if (cd "$vendor_dir" && zig fetch "$file") >/dev/null 2>&1; then
       echo "ok   $url"
     else
       echo "FAIL zig fetch rejected: $url" >&2

@@ -176,6 +176,8 @@ pub(crate) fn sbx_create_argv(
         workspace_dir.to_string(),
         "--name".to_string(),
         sandbox_name(slug),
+        "--skills".to_string(),
+        "off".to_string(),
         "--kit-arg".to_string(),
         format!("roles={}", roles.kit_arg()),
     ];
@@ -184,6 +186,17 @@ pub(crate) fn sbx_create_argv(
         argv.push(mixin.clone());
     }
     argv
+}
+
+/// Recognize the current, selected Codex updater without acting on old history
+/// or unrelated confirmation dialogs. Callers supply the detection snapshot.
+pub(crate) fn codex_startup_update_menu(kind: &str, state: &str, screen: &str) -> bool {
+    kind == "codex"
+        && state == "blocked"
+        && screen.contains("Update available!")
+        && screen.contains("› 1. Update now")
+        && screen.contains("2. Skip")
+        && screen.contains("Press enter to continue")
 }
 
 /// Quote one argument for the remote shell command line ssh assembles.
@@ -353,6 +366,8 @@ mod tests {
                 "/work/repo",
                 "--name",
                 "herdr-task-demo",
+                "--skills",
+                "off",
                 "--kit-arg",
                 "roles=orchestrator=gemini,planner=gemini,implementer=codex,qc=claude",
             ]
@@ -364,7 +379,7 @@ mod tests {
         ];
         let argv = sbx_create_argv("./kits/herdr-crew/", "/work/repo", "demo", &roles, &mixins);
         assert_eq!(
-            argv[8..],
+            argv[10..],
             [
                 "--kit",
                 "git+https://github.com/shelajev/yt-transcript-sbx-kit.git",
@@ -372,6 +387,24 @@ mod tests {
                 "docker.io/example/other-mixin:1.0",
             ]
         );
+    }
+
+    #[test]
+    fn codex_updater_recovery_rejects_history_and_unrelated_dialogs() {
+        let menu = "Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
+        assert!(codex_startup_update_menu("codex", "blocked", menu));
+        assert!(!codex_startup_update_menu("codex", "working", menu));
+        assert!(!codex_startup_update_menu("claude", "blocked", menu));
+        assert!(!codex_startup_update_menu(
+            "codex",
+            "blocked",
+            "Do you trust this folder?\nPress enter to continue"
+        ));
+        assert!(!codex_startup_update_menu(
+            "codex",
+            "blocked",
+            &menu.replace("› 1.", "  1.")
+        ));
     }
 
     #[test]

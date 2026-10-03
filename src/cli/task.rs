@@ -266,8 +266,7 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
     println!("waiting for the herdr server inside the sandbox...");
     let host = ssh_host(&slug);
     for attempt in 1..=READY_POLL_ATTEMPTS {
-        // `herdr status server` exits 0 whether or not a server is running, so
-        // readiness must check the reported status text, not the exit code.
+        // Require a real server request: status text can describe stale state.
         let probe = server_running_probe(&host)?;
         if probe.exit_code == 0 {
             println!("task {slug} is ready.");
@@ -295,15 +294,13 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
     Ok(1)
 }
 
-/// Idempotent remote start of the headless server (safe to run repeatedly).
+/// Start only after a failed server request. A pgrep guard can match itself.
+/// Give the server its own session so SSH cleanup cannot terminate its process group.
 const START_SERVER_REMOTE: &str =
-    "pgrep -f 'herdr server' >/dev/null 2>&1 || (nohup herdr server >>/tmp/herdr-server.log 2>&1 &)";
+    "nohup setsid -f herdr server >>/tmp/herdr-server.log 2>&1 </dev/null &";
 
 fn server_running_probe(host: &str) -> std::io::Result<RemoteOutput> {
-    ssh_capture(
-        host,
-        "herdr status server 2>/dev/null | grep -q 'status: running'",
-    )
+    ssh_capture(host, "herdr agent list >/dev/null 2>&1")
 }
 
 /// Make sure the inner herdr server is actually up before talking to it.
@@ -398,7 +395,25 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
          'RESULT: DONE', 'RESULT: FAILED', or 'RESULT: BLOCKED' to {CREW_DIR}/status.md. \
          The workspace is {workdir}. /goal: {goal}"
     );
-    if let Err(err) = ssh_herdr_json(&host, &["agent", "prompt", "orchestrator", &goal_prompt])? {
+    // Starting a TUI can briefly look idle before its final initialization
+    // redraw. Confirm the prompt actually triggered work rather than treating
+    // a successful input write as successful goal delivery.
+    if let Err(err) = ssh_herdr_json(
+        &host,
+        &[
+            "agent",
+            "prompt",
+            "orchestrator",
+            &goal_prompt,
+            "--wait",
+            "--until",
+            "working",
+            "--until",
+            "blocked",
+            "--timeout",
+            "60000",
+        ],
+    )? {
         eprintln!("failed to deliver the goal: {err}");
         return Ok(1);
     }
@@ -547,6 +562,7 @@ fn ensure_agent(
         .map_err(|err| err.to_string())?
         .is_ok();
     if exists {
+        dismiss_codex_update(host, role)?;
         return Ok(());
     }
 
@@ -554,25 +570,49 @@ fn ensure_agent(
         return Err(format!("no kind assigned for role {role}"));
     };
     println!("starting {role} ({kind})...");
-    let tab = ssh_herdr_json(
-        host,
-        &[
-            "tab",
-            "create",
-            "--cwd",
-            workdir,
-            "--label",
-            role,
-            "--no-focus",
-        ],
-    )
+    let workspaces =
+        ssh_herdr_json(host, &["workspace", "list"]).map_err(|err| err.to_string())??;
+    let workspace_id = workspaces
+        .pointer("/result/workspaces/0/workspace_id")
+        .and_then(|value| value.as_str());
+    let created = if let Some(workspace_id) = workspace_id {
+        ssh_herdr_json(
+            host,
+            &[
+                "tab",
+                "create",
+                "--workspace",
+                workspace_id,
+                "--cwd",
+                workdir,
+                "--label",
+                role,
+                "--no-focus",
+            ],
+        )
+    } else {
+        // A fresh headless server has no workspace. Its first role uses the
+        // root pane of a new workspace; subsequent roles get their own tabs.
+        ssh_herdr_json(
+            host,
+            &[
+                "workspace",
+                "create",
+                "--cwd",
+                workdir,
+                "--label",
+                role,
+                "--focus",
+            ],
+        )
+    }
     .map_err(|err| err.to_string())??;
-    let Some(pane_id) = tab
+    let Some(pane_id) = created
         .pointer("/result/root_pane/pane_id")
         .and_then(|value| value.as_str())
         .map(str::to_string)
     else {
-        return Err(format!("tab create returned no pane id: {tab}"));
+        return Err(format!("role pane creation returned no pane id: {created}"));
     };
 
     let timeout = AGENT_START_TIMEOUT_MS.to_string();
@@ -600,6 +640,11 @@ fn ensure_agent(
     } else {
         let mut argv = vec!["herdr"];
         argv.append(&mut start_args);
+        if kind == "codex" {
+            // Crew CLI updates belong to template maintenance, not an unattended
+            // startup menu. This also protects existing sandbox configurations.
+            argv.extend(["--", "-c", "check_for_update_on_startup=false"]);
+        }
         tasks::remote_command(&argv)
     };
     let output = ssh_capture(host, &start_remote).map_err(|err| err.to_string())?;
@@ -613,6 +658,45 @@ fn ensure_agent(
                 output.stderr.trim()
             }
         ));
+    }
+    Ok(())
+}
+
+/// Recover only the known updater menu in older crew images. Never press
+/// confirmation keys for an arbitrary blocked agent or permission dialog.
+fn dismiss_codex_update(host: &str, role: &str) -> Result<(), String> {
+    let agent = ssh_herdr_json(host, &["agent", "get", role]).map_err(|err| err.to_string())??;
+    let kind = agent
+        .pointer("/result/agent/agent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let state = agent
+        .pointer("/result/agent/agent_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if kind != "codex" || state != "blocked" {
+        return Ok(());
+    }
+    let remote = tasks::remote_command(&[
+        "herdr",
+        "agent",
+        "read",
+        role,
+        "--source",
+        "detection",
+        "--format",
+        "text",
+    ]);
+    let screen = ssh_capture(host, &remote).map_err(|err| err.to_string())?;
+    if tasks::codex_startup_update_menu(kind, state, &screen.stdout) {
+        let remote = tasks::remote_command(&["herdr", "agent", "send-keys", role, "down", "enter"]);
+        let output = ssh_capture(host, &remote).map_err(|err| err.to_string())?;
+        if output.exit_code != 0 {
+            return Err(format!(
+                "could not dismiss the Codex update menu: {}",
+                output.stderr
+            ));
+        }
     }
     Ok(())
 }
@@ -679,11 +763,36 @@ fn task_status(args: &[String]) -> std::io::Result<i32> {
                         .and_then(|value| value.as_str())
                         .unwrap_or("?");
                     println!("{name}\t{kind}\t{state}");
+                    if state == "blocked" {
+                        let remote = tasks::remote_command(&[
+                            "herdr",
+                            "agent",
+                            "read",
+                            name,
+                            "--source",
+                            "recent-unwrapped",
+                            "--format",
+                            "text",
+                        ]);
+                        let screen = ssh_capture(&host, &remote)?;
+                        if !screen.stdout.trim().is_empty() {
+                            println!("--- blocked agent {name} ---\n{}", screen.stdout.trim());
+                        }
+                    }
                 }
             }
         }
         Err(err) => {
             eprintln!("{err}");
+            // Keep diagnosis inside the task lifecycle: a missing server can
+            // leave the VM running while its crew has stopped making progress.
+            let log = ssh_capture(
+                &host,
+                "tail -n 40 /tmp/herdr-server.log /home/agent/.config/herdr/herdr-server.log 2>/dev/null",
+            )?;
+            if !log.stdout.trim().is_empty() {
+                eprintln!("sandbox server log:\n{}", log.stdout.trim());
+            }
             return Ok(1);
         }
     }
