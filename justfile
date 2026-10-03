@@ -9,6 +9,7 @@ test:
     just maintenance-test
     just ui-hot-path-architecture-test
     just integration-assets-test
+    just fork-compat-test
     just docs-contract-test
 
 # Run repository maintenance contract tests
@@ -24,6 +25,13 @@ test-windows-input *args:
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
     cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
+
+# Contracts this fork must keep after an upstream merge: task CLI and role ids,
+# sandbox isolation, completion evidence, host-driver update policy, workflow
+# publishing guards, and the crew kit schema.
+fork-compat-test:
+    {{python}} -m unittest scripts.test_fork_sync
+    bun test scripts/fork-workflows.test.ts
 
 # Enforce deterministic UI hot-path architecture boundaries
 ui-hot-path-architecture-test:
@@ -50,6 +58,7 @@ ci-tests filter='all()':
     just maintenance-test
     just ui-hot-path-architecture-test
     just integration-assets-test
+    just fork-compat-test
 
 # Download the Windows SDK once (requires xwin; prompts for Microsoft's SDK license)
 [unix]

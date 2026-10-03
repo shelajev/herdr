@@ -1,0 +1,167 @@
+name: Fork upstream sync
+
+# Keeps this fork current with herdrdev/herdr by *merging* upstream into one
+# generated branch and opening a single rolling pull request against fork
+# master. It never rewrites fork master, never force-pushes, never merges or
+# deploys anything itself, and never opens a pull request upstream.
+
+on:
+  schedule:
+    # Daily, early UTC, so a failure is visible at the start of the day.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One sync at a time: two runs pushing the same generated branch would race.
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  sync:
+    name: Prepare and validate the upstream sync candidate
+    # Fork guard: the canonical repository has nothing to sync from, and a
+    # different fork must not have a branch pushed into it by this workflow.
+    if: github.repository == 'shelajev/herdr'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      # Pushing the generated branch and opening/updating one pull request.
+      # Nothing else: no packages, no deployments, no id-token.
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          # Full history: the sync merges, and a shallow clone has no merge base.
+          fetch-depth: 0
+          ref: master
+          persist-credentials: true
+
+      - name: Confirm this is the fork
+        # Real validation: fails the run when origin is not github.com/shelajev/herdr.
+        run: python3 scripts/fork_sync.py --repo . check-repository
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/herdrdev/herdr.git
+          git fetch --quiet origin
+          git fetch --quiet upstream master
+
+      - name: Prepare merge candidate
+        id: candidate
+        run: |
+          set -euo pipefail
+          git config user.name "herdr fork sync"
+          git config user.email "fork-sync@users.noreply.github.com"
+          # Fails visibly on conflict. Scratch files live in RUNNER_TEMP so they
+          # can never be picked up as workspace changes.
+          python3 scripts/fork_sync.py --repo . prepare \
+            --out "$RUNNER_TEMP/candidate.json" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/candidate.json"
+
+      # Everything below validates the candidate *in this workflow*. A pull
+      # request opened with the default GITHUB_TOKEN does not trigger the normal
+      # `pull_request` workflows, so assuming downstream CI would check this
+      # branch would mean publishing an unvalidated candidate.
+      - name: Install Rust
+        if: steps.candidate.outputs.status == 'ready'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: rustfmt,clippy
+
+      - name: Install Rust tools
+        if: steps.candidate.outputs.status == 'ready'
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: just,cargo-nextest
+
+      - name: Install Bun
+        if: steps.candidate.outputs.status == 'ready'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install Zig
+        if: steps.candidate.outputs.status == 'ready'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Restore cargo cache
+        if: steps.candidate.outputs.status == 'ready'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: fork-sync
+
+      - name: Validate candidate
+        id: validate
+        if: steps.candidate.outputs.status == 'ready'
+        # Linux runs the full suite, live_handoff included, plus the fork
+        # compatibility contracts. Anything less would publish a branch nobody
+        # checked.
+        run: |
+          just ci 'all()'
+          just fork-compat-test
+
+      - name: Push the validated candidate
+        id: push
+        if: steps.candidate.outputs.status == 'ready' && steps.validate.outcome == 'success'
+        # Goes through fork_sync.publish(), which re-checks the repository
+        # identity, that HEAD still equals the candidate that was validated, and
+        # that the tree is clean, before a plain (never forced) push. A raw
+        # `git push` here would skip all three.
+        run: |
+          python3 scripts/fork_sync.py --repo . publish \
+            --candidate "$RUNNER_TEMP/candidate.json" \
+            --validated
+
+      - name: Open or update the pull request
+        if: steps.push.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: automation/upstream-sync
+          CANDIDATE: ${{ steps.candidate.outputs.head }}
+        run: |
+          set -euo pipefail
+          existing=$(gh pr list --head "$BRANCH" --base master --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "updated existing pull request #$existing with $CANDIDATE"
+            exit 0
+          fi
+          body="$RUNNER_TEMP/pr-body.md"
+          cat > "$body" <<EOF
+          Automated merge-only upstream sync.
+
+          Candidate: \`$CANDIDATE\`
+
+          Fork commits are preserved and fork master is never rewritten. The
+          candidate was validated in this workflow (\`just ci 'all()'\` plus
+          \`just fork-compat-test\`) because a pull request opened with
+          \`GITHUB_TOKEN\` does not trigger the normal CI workflows.
+
+          Review and merge by hand.
+          EOF
+          if ! gh pr create \
+              --base master \
+              --head "$BRANCH" \
+              --title "chore: merge upstream herdrdev/herdr master" \
+              --body-file "$body"; then
+            echo "::error::could not create the sync pull request. If this repository" \
+                 "disallows GitHub Actions from creating pull requests, enable that" \
+                 "setting or open the pull request from branch $BRANCH by hand."
+            exit 1
+          fi
+
+      - name: Report a no-op
+        if: steps.candidate.outputs.status == 'up-to-date'
+        run: echo "already in sync with upstream; nothing to publish"
