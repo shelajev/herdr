@@ -1881,6 +1881,35 @@ fn print_running_session_update_outcomes(
 // Installation manager detection
 // ---------------------------------------------------------------------------
 
+/// Whether this binary is the fork's host task driver.
+///
+/// `self_update` resolves `env::current_exe()` and renames a downloaded
+/// artifact over it. The manifest it downloads from `herdr.dev` describes
+/// *upstream* Herdr builds, which do not carry the `herdr task` crew commands
+/// this fork adds. Letting the updater run would therefore delete the host task
+/// driver and replace it with a binary that cannot drive a crew sandbox — and
+/// the failure would only surface later, as a missing subcommand.
+///
+/// The check is capability-based, not name-based: it asks whether this build
+/// has the task commands, so renaming or relocating the artifact does not
+/// bypass it. It says nothing about the *inner* Herdr running inside a crew
+/// sandbox, which is an ordinary upstream build and keeps its own updater.
+pub(crate) fn is_fork_task_driver() -> bool {
+    crate::cli::spec::has_task_commands()
+}
+
+/// Why the fork host task driver refuses to self-update, and what to do
+/// instead. Promotion is a deliberate host action against a reviewed commit,
+/// not a download.
+pub(crate) const FORK_TASK_DRIVER_UPDATE_REJECTION: &str =
+    "self-update is disabled for this build: it is the fork host task driver and carries the \
+     `herdr task` crew commands, which herdr.dev's upstream builds do not. Installing an \
+     upstream release over it would remove them. Promote a new host driver instead: build it \
+     from a fork commit that passed independent QC, record the artifact checksum, verify \
+     `herdr task` and the crew kit/evidence contracts against it, then install it deliberately \
+     and keep the previous artifact for rollback. The Herdr running inside a crew sandbox is a \
+     separate, ordinary upstream install and may be pinned to an upstream release.";
+
 pub(crate) fn update_install_command() -> &'static str {
     if is_homebrew_managed_install() {
         HOMEBREW_UPDATE_COMMAND
@@ -2107,6 +2136,12 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    // Checked before the channel, the manifest, and any download: the refusal
+    // must not depend on reaching the network or on which channel is selected.
+    if is_fork_task_driver() {
+        return Err(FORK_TASK_DRIVER_UPDATE_REJECTION.to_string());
+    }
+
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2346,6 +2381,16 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
 /// Background update check: only surface availability and release notes.
 /// Runs in a background thread at startup.
 pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
+    // The fork host task driver never offers an upstream replacement, so it
+    // never reaches a download or an UpdateReady handoff. Returning before the
+    // check is started keeps the background thread silent rather than
+    // repeatedly reporting a failure the operator cannot act on.
+    if is_fork_task_driver() {
+        tracing::debug!("skipping update check: fork host task driver");
+        let _ = &events;
+        return;
+    }
+
     crate::logging::update_check_started();
     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
         let version = version.trim();
@@ -2503,6 +2548,93 @@ fn platform_target() -> (&'static str, &'static str) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Fork host task driver update policy
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn this_build_is_recognized_as_the_fork_host_task_driver() {
+        // Identity comes from the compiled CLI surface, so the policy cannot be
+        // bypassed by renaming or relocating the artifact.
+        assert!(
+            is_fork_task_driver(),
+            "this source carries `herdr task`, so its builds must be treated as the fork driver"
+        );
+        assert!(crate::cli::spec::has_task_commands());
+    }
+
+    #[test]
+    fn manual_self_update_refuses_before_downloading_anything() {
+        // No manifest URL is reachable in a unit test; the point is that the
+        // refusal happens before the updater would try, on every channel.
+        for channel in ["stable", "preview"] {
+            let _ = channel;
+            let error = self_update(SelfUpdateOptions::default())
+                .expect_err("the fork host task driver must refuse to self-update");
+            assert_eq!(error, FORK_TASK_DRIVER_UPDATE_REJECTION);
+        }
+    }
+
+    #[test]
+    fn the_refusal_explains_promotion_instead_of_an_upstream_install() {
+        let rejection = FORK_TASK_DRIVER_UPDATE_REJECTION;
+        // It must not send the operator to the thing that breaks the driver.
+        assert!(!rejection.contains("herdr update"));
+        assert!(!rejection.contains("herdr-dev update"));
+        // It must name the actual promotion path and the rollback requirement.
+        assert!(rejection.contains("independent QC"));
+        assert!(rejection.contains("checksum"));
+        assert!(rejection.contains("rollback"));
+        // It must keep the inner sandbox Herdr explicitly out of scope.
+        assert!(rejection.contains("inside a crew sandbox"));
+    }
+
+    #[test]
+    fn automatic_update_never_hands_off_a_replacement() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        auto_update(tx);
+        // No UpdateReady event, so the TUI never offers an upstream install and
+        // no replacement handoff can start.
+        assert!(
+            rx.try_recv().is_err(),
+            "the fork host task driver must not emit an update offer"
+        );
+    }
+
+    #[test]
+    fn a_refused_update_leaves_the_running_artifact_untouched() {
+        // self_update is the only path that renames a download over
+        // env::current_exe(); if it returns before that, the executable on disk
+        // is byte-identical afterwards.
+        let exe = std::env::current_exe().expect("current exe");
+        let before = std::fs::read(&exe).expect("read current exe");
+        let error = self_update(SelfUpdateOptions::default()).expect_err("must refuse");
+        assert_eq!(error, FORK_TASK_DRIVER_UPDATE_REJECTION);
+        let after = std::fs::read(&exe).expect("read current exe");
+        assert!(
+            before == after,
+            "a refused update must not modify the running artifact"
+        );
+    }
+
+    #[test]
+    fn the_task_cli_contract_survives_a_refused_update() {
+        let _ = self_update(SelfUpdateOptions::default());
+        let subcommands = crate::cli::spec::task_subcommand_names();
+        assert!(
+            !subcommands.is_empty(),
+            "`herdr task` must still exist after a refused update"
+        );
+        for required in [
+            "new", "goal", "watch", "ls", "status", "attach", "policy", "rm",
+        ] {
+            assert!(
+                subcommands.iter().any(|name| name == required),
+                "`herdr task {required}` must survive a refused update, have {subcommands:?}"
+            );
+        }
+    }
     use std::os::unix::net::UnixListener;
     use std::sync::{
         atomic::{AtomicBool, Ordering},

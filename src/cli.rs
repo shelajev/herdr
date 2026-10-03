@@ -34,7 +34,7 @@ mod protocol_guard;
 mod runtime;
 mod server;
 mod server_not_running;
-mod spec;
+pub(crate) mod spec;
 mod status;
 mod tab;
 mod target;

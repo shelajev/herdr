@@ -5,6 +5,33 @@ use clap::{Arg, ArgAction, ArgGroup, Command, ValueHint};
 mod completion;
 mod machine;
 
+/// Whether this build carries the fork's `herdr task` crew commands.
+///
+/// Update policy keys off this rather than the binary's filename or install
+/// path: a fork artifact that someone renames, copies, or installs elsewhere is
+/// still the host task driver, and replacing it with an upstream build would
+/// silently remove every `herdr task` subcommand.
+/// The fork's `herdr task` subcommand names, as this build actually parses
+/// them. Used to assert the task CLI contract survives update policy changes.
+#[cfg(test)]
+pub(crate) fn task_subcommand_names() -> Vec<String> {
+    command()
+        .get_subcommands()
+        .find(|subcommand| subcommand.get_name() == "task")
+        .map(|task| {
+            task.get_subcommands()
+                .map(|subcommand| subcommand.get_name().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn has_task_commands() -> bool {
+    command()
+        .get_subcommands()
+        .any(|subcommand| subcommand.get_name() == "task")
+}
+
 pub(super) fn command() -> Command {
     let command = Command::new("herdr")
         .about("terminal workspace manager for AI coding agents")
