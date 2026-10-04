@@ -219,9 +219,12 @@ class CodexTrustSeedingTests(unittest.TestCase):
         self.config.write_text(self.CONFIG)
         self.workspace = self.root / "work" / "proj"
         self.workspace.mkdir(parents=True)
+        # Stand-in for the agent's home, away from the real /home/agent.
+        self.home = self.root / "home" / "agent"
+        self.home.mkdir(parents=True)
 
-    def seed(self, workspace, shell="/bin/sh", workdir=None, cwd=None):
-        env = {"PATH": os.environ["PATH"]}
+    def seed(self, workspace, shell="/bin/sh", workdir=None, cwd=None, home=None):
+        env = {"PATH": os.environ["PATH"], "HOME": str(home or self.home)}
         if workspace is not None:
             env["WORKSPACE_DIR"] = str(workspace)
         if workdir is not None:
@@ -343,6 +346,69 @@ class CodexTrustSeedingTests(unittest.TestCase):
         self.assertNotIn("secret", result.stderr)
         self.assertEqual(result.stderr.count("\n"), 1)
         self.assertEqual(self.config.read_text(), self.CONFIG)
+
+    def test_home_directory_is_rejected_from_either_source(self):
+        link = self.root / "home-link"
+        link.symlink_to(self.home)
+        (self.home / "sub").mkdir()
+        for workspace in (self.home, f"{self.home}/", f"{self.home}/sub/..", link):
+            with self.subTest(workspace=str(workspace), source="WORKSPACE_DIR"):
+                self.assertRefused(workspace, "agent home directory or an ancestor")
+            with self.subTest(workspace=str(workspace), source="WORKDIR"):
+                result = self.seed(None, workdir=workspace)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("WORKDIR is the agent home directory", result.stderr)
+                self.assertEqual(self.config.read_text(), self.CONFIG)
+
+    def test_ancestors_of_home_are_rejected(self):
+        for ancestor in (self.home.parent, self.root):
+            with self.subTest(ancestor=str(ancestor)):
+                self.assertRefused(ancestor, "agent home directory or an ancestor")
+
+    def test_the_image_home_is_rejected_even_when_home_differs(self):
+        if not Path("/home/agent").is_dir():
+            self.skipTest("/home/agent does not exist here")
+        self.assertRefused("/home/agent", "agent home directory or an ancestor")
+
+    def test_system_roots_are_rejected(self):
+        for root in ("/home", "/tmp", "/usr", "/etc", "/var", "/root"):
+            with self.subTest(root=root):
+                # A home elsewhere, so /tmp is not refused as an ancestor of it.
+                result = self.seed(root, home="/nonexistent-home")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("cannot seed Codex trust", result.stderr)
+                self.assertEqual(self.config.read_text(), self.CONFIG)
+                if Path(root).is_dir() and root != "/home":
+                    self.assertIn("is a system directory", result.stderr)
+
+    def test_a_project_next_to_or_below_home_is_accepted(self):
+        sibling = self.home.parent / "proj"
+        child = self.home / "workspace"
+        sibling.mkdir()
+        child.mkdir()
+        for workspace in (sibling, child, self.root / "tmp-like"):
+            workspace.mkdir(exist_ok=True)
+            with self.subTest(workspace=str(workspace)):
+                self.config.write_text(self.CONFIG)
+                result = self.seed(workspace)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(list(self.projects()), [str(workspace)])
+
+    def test_invalid_workspace_dir_and_home_workdir_fail_naming_both(self):
+        result = self.seed("relative/dir", workdir=self.home)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("WORKSPACE_DIR is not an absolute path", result.stderr)
+        self.assertIn("WORKDIR is the agent home directory or an ancestor", result.stderr)
+        self.assertEqual(result.stderr.count("\n"), 1)
+        self.assertNotIn(";)", result.stderr)
+        self.assertEqual(self.config.read_text(), self.CONFIG)
+
+    def test_a_home_workspace_dir_falls_through_to_a_valid_workdir(self):
+        result = self.seed(self.home, workdir=self.workspace)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(from WORKDIR)", result.stdout)
+        self.assertIn("skipped WORKSPACE_DIR is the agent home directory", result.stderr)
+        self.assertEqual(list(self.projects()), [str(self.workspace)])
 
     def test_the_cwd_is_never_a_workspace_source(self):
         # kits-v2 install steps start in the template WORKDIR, which must not

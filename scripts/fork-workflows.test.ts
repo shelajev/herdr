@@ -316,6 +316,9 @@ describe("crew kit declaration", () => {
     expect(step.command).toContain('raw="${WORKSPACE_DIR:-}"');
     expect(step.command).toContain('raw="${WORKDIR:-}"');
     expect(step.command).not.toContain("pwd");
+    // Never the agent's home or its ancestors, nor a system root.
+    expect(step.command).toContain("agent home directory or an ancestor");
+    expect(step.command).toContain("/home | /tmp | /usr | /etc | /var | /root");
     expect(step.command).toContain("readlink -f");
     // An unusable workspace must fail the install, not warn and succeed.
     expect(step.command).not.toContain("exit 0");

@@ -276,7 +276,9 @@ setup:
     # runtime really sets during install is unverified until the host pair
     # smoke. A candidate must be absolute, free of control characters, resolve
     # (dot segments, symlinks; Codex keys trust by its canonical cwd) to a real
-    # directory, and not be "/". If none qualifies the step fails, so the
+    # directory, and not be "/", the agent's home directory or an ancestor of
+    # it (a template WORKDIR such as /home/agent is not the project), or one of
+    # /home /tmp /usr /etc /var /root. If none qualifies the step fails, so the
     # sandbox never installs "successfully" with a Codex that would hang on the
     # dialog. /home/agent/crew/workdir is not a source: setup.files appear to be
     # written after setup.install.
@@ -297,7 +299,17 @@ setup:
             *[[:cntrl:]]*) ws=""; reason="resolves to a path with control characters ('$1')"; return 1 ;;
           esac
           [ -d "$ws" ] || { ws=""; reason="is not a directory ('$1')"; return 1; }
+          for h in /home/agent "$home"; do
+            [ -n "$h" ] || continue
+            case "$h/" in
+              "$ws"/*) ws=""; reason="is the agent home directory or an ancestor of it ('$1')"; return 1 ;;
+            esac
+          done
+          case "$ws" in
+            /home | /tmp | /usr | /etc | /var | /root) ws=""; reason="is a system directory ('$1')"; return 1 ;;
+          esac
         }
+        home=$(readlink -f -- "${HOME:-/home/agent}" 2>/dev/null) || home=""
         ws=""
         src=""
         problems=""
@@ -311,7 +323,10 @@ setup:
           fi
           problems="$problems $src $reason;"
         done
-        [ -n "$ws" ] || fail "no usable workspace (${problems# })"
+        if [ -z "$ws" ]; then
+          problems=${problems# }
+          fail "no usable workspace (${problems%;})"
+        fi
         [ -z "$problems" ] || echo "herdr-crew: skipped${problems%;}" >&2
         echo "herdr-crew: seeding Codex trust for $ws (from $src)"
         esc=$(printf '%s' "$ws" | sed 's/\\/\\\\/g; s/"/\\"/g')
