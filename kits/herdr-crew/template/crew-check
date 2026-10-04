@@ -30,8 +30,10 @@ errfile=$(mktemp) || { echo "herdr-crew: cannot create a temporary file" >&2; ex
 trap 'rm -f "$errfile"' EXIT
 
 # version_of <tool> <command...>
-# Runs the command and sets VERSION to the first line of its stdout. Returns
-# non-zero, after reporting why, when the command fails or prints nothing.
+# Runs the command and sets VERSION to the first line of its stdout; any other
+# stdout lines, and stderr from a command that succeeded, are not reported.
+# Returns non-zero, after reporting why (including the command's stderr), when
+# the command fails or prints nothing.
 VERSION=""
 version_of() {
   local tool=$1 out status first

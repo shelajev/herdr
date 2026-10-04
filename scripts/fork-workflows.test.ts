@@ -283,6 +283,9 @@ describe("crew kit declaration", () => {
     expect(spec.args.image.default).toMatch(/^docker\.io\//);
     expect(spec.args.image.default).toBe("docker.io/olegselajev241/herdr-crew:0.5.1");
     expect(spec.sandbox.build).toBeUndefined();
+    // 0.5.1 is a candidate until the host builds and publishes it.
+    expect(spec.args.image.description).not.toContain("(published");
+    expect(spec.args.image.description).toContain("candidate");
   });
 
   test("supervises the server with a real request in detached sandboxes", () => {
