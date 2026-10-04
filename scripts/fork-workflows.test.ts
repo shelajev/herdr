@@ -281,7 +281,7 @@ describe("crew kit declaration", () => {
   test("boots from a published image and never builds one at creation", () => {
     expect(spec.sandbox.image).toBe("${{ kit.args.image }}");
     expect(spec.args.image.default).toMatch(/^docker\.io\//);
-    expect(spec.args.image.default).toBe("docker.io/olegselajev241/herdr-crew:0.5.0");
+    expect(spec.args.image.default).toBe("docker.io/olegselajev241/herdr-crew:0.5.1");
     expect(spec.sandbox.build).toBeUndefined();
   });
 

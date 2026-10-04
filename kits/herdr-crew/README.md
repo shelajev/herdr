@@ -61,9 +61,9 @@ template is rebuilt.
   declares proxy-managed credentials (real API keys never enter the VM) and
   the baseline network allowlist.
 - **Template image** (`template/Dockerfile`, candidate default
-  `docker.io/olegselajev241/herdr-crew:0.5.0`, not published yet, linux/arm64): herdr + Claude
-  Code + Codex + pi + beans baked in so sandbox creation is fast; `crew-entry`
-  supervises the headless herdr server.
+  `docker.io/olegselajev241/herdr-crew:0.5.1`, not published yet, linux/arm64): herdr + Claude
+  Code + Codex + pi + beans + a pinned Node.js 22.22.1 baked in so sandbox creation
+  is fast; `crew-entry` supervises the headless herdr server.
 - **Crew files** (`/home/agent/crew/` in the sandbox): `assignment`,
   `workdir`, `models`, `goal.md`, `plan.md`, `qc-log.md`, `status.md` and
   `escalations.md`. The host writes `run.json`; QC writes `qc.json`; the native
@@ -108,7 +108,10 @@ at all.
 
 ### Dated installed-state inventory
 
-This source tree is kit version **0.5.0**, not published yet. The host inventory
+This source tree is kit version **0.5.1**, a corrected candidate that is not
+published yet. Kit and image 0.5.0 are published and immutable; they ship Node.js
+20.19.4, below the floors of Claude Code 2.1.289 (>=22) and pi 0.85.1 (>=22.19),
+and their Codex start stops at the workspace trust dialog. The host inventory
 recorded on 2026-10-03 lists host task driver 0.8.2 and published kit 0.4.5
 (`docker.io/olegselajev241/herdr-crew-kit:latest`, also `:0.4.5`). These are dated
 observations, not a claim about what a mutable registry tag resolves to later.
@@ -127,12 +130,14 @@ and kit; existing sandboxes keep their old files. Build the fork driver from the
 reviewed commit and record its checksum. Do not install it over an upstream build
 by running `herdr update`.
 
-1. Confirm the intended kit tag is unused. Keep 0.5.0 only if it has never been
-   published; otherwise bump the kit version and its README version string before
-   publication. Never overwrite `:0.4.5` or reuse a published version tag.
-2. Build and publish the template as `docker.io/olegselajev241/herdr-crew:0.5.0`
+1. Confirm the intended kit tag, 0.5.1, is unused. Never overwrite `:0.4.5` or
+   `:0.5.0` or reuse any published version tag.
+2. Build and publish the template as `docker.io/olegselajev241/herdr-crew:0.5.1`
    and record its digest; this is the candidate kit's image default. The Dockerfile
-   keeps `HERDR_VERSION=0.9.3` and pins its CLI build defaults to
+   installs Node.js `22.22.1` from nodejs.org after verifying its SHA256 (the build
+   needs nodejs.org reachable and fails rather than keep the base image's Node),
+   `crew-check` then fails the build on a Node below the CLI floors. It also keeps
+   `HERDR_VERSION=0.9.3` and pins its CLI build defaults to
    `CLAUDE_CODE_VERSION=2.1.289`, `CODEX_VERSION=0.153.4` and `PI_VERSION=0.85.1`,
    the CLI versions tested in the development sandbox. Moving its observed inner
    runtime from 0.9.0 to 0.9.3 requires this host-owned rebuild. Source edits do
@@ -153,12 +158,11 @@ Tasks run from published kits. For the host's later staging step, from this
 repository root and only after confirming the version tag is unused:
 
 ```bash
-sbx kit push ./kits/herdr-crew docker.io/olegselajev241/herdr-crew-kit:0.5.0
-export HERDR_TASK_KIT=docker.io/olegselajev241/herdr-crew-kit:0.5.0
+sbx kit push ./kits/herdr-crew docker.io/olegselajev241/herdr-crew-kit:0.5.1
+export HERDR_TASK_KIT=docker.io/olegselajev241/herdr-crew-kit:0.5.1
 ```
 
-These are publication instructions, not actions performed by this change. If the
-version had to be bumped, use that version in both commands. Only `task new`
+These are publication instructions, not actions performed by this change. Only `task new`
 resolves the kit; `goal` and `watch` use the already-created sandbox. Editing local
 kit files does not update it. The host's detailed inventory and build checklist
 are in [fork compatibility](../../docs/fork-compatibility.md).

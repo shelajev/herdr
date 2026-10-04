@@ -45,7 +45,7 @@ Verified on the host, 2026-10-03:
 | Installed host task driver | `/Users/shelajev/.local/bin/herdr-dev`, reports `herdr 0.8.2` |
 | Its source | `dd4e3770` plus uncommitted repairs — not a clean source commit |
 | Its SHA256 | `1f000cfe4d0380ee2d17a46cd38f5ff641984b110ecc1f90c30a64dffe2af39e` |
-| Kit version in this source tree | 0.5.0 — **not published** |
+| Kit version in this source tree | 0.5.1 — **not published** (0.5.0 is published and immutable) |
 | Published kit | `herdr-crew-kit:latest` = version 0.4.5 |
 | Published kit digest (`:latest`) | `sha256:dbeb8b7c4ba2441d3f21d61430e9b5595fdc10f42ef95071d0a0890121de3afe` |
 | Published kit digest (`:0.4.5`) | `sha256:4b28f8d50e028d6bbb8407a14dc1a7d0f549ce236338d8b2fd7dd5afe3594753` |
@@ -66,16 +66,21 @@ kit or template was installed or published by these source changes.
 
 ### Candidate kit and driver pairing
 
-The source kit remains 0.5.0, treated as unpublished. The 2026-10-03 inventory
-records published kit 0.4.5. The candidate adds a models file, pinned starts and
+Published kit and image 0.5.0 are immutable and defective: the image's Node.js
+20.19.4 is below Claude Code 2.1.289 (>=22) and pi 0.85.1 (>=22.19), and `crew-check`
+hid failed or blank version output. A fresh Codex 0.153.4 start in the task workspace
+also stops at the trust dialog. The source kit is therefore the corrected candidate
+0.5.1: it pins Node.js 22.22.1 (checksum-verified from nodejs.org), makes `crew-check`
+truthful and enforces the Node floors, and trusts only the task workspace in Codex.
+The 2026-10-03 inventory records published kit 0.4.5. The candidate adds a models file, pinned starts and
 response probes, run acknowledgments, native phase recovery and schema-v2 QC.
 An old kit lacks these files; the candidate host refuses it. An old host cannot
 supply the new run/ACK protocol and may still trust a prose DONE result.
 
-Promotion requires a tested driver/kit pair. The host must confirm 0.5.0 was
-never published before using that tag; otherwise bump the source kit version and
-README version string and publish under the new version. Do not overwrite 0.4.5
-or any already-published version tag. Publish a candidate tag for testing, then
+Promotion requires a tested driver/kit pair. The host must confirm 0.5.1 is
+unused before publishing it, and must build the template image before the kit;
+neither step happened here. Do not overwrite 0.4.5, 0.5.0 or any other
+already-published version tag. Publish a candidate tag for testing, then
 use `HERDR_TASK_KIT` to select that exact reference with the new driver. Only
 after end-to-end checks pass should the host drain old tasks, move `:latest` and
 install the new driver together. None of those publication steps happened here.
