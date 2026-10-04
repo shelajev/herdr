@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::tasks::{
-    self, parse_result, parse_roles, rotation_for, sandbox_name, sbx_create_argv, shell_quote,
-    ssh_host, validate_slug, RoleAssignment, TaskResult,
+    self, parse_result, parse_roles, resolve_mcp_names, rotation_for, sandbox_name,
+    sbx_create_argv, shell_quote, ssh_host, validate_slug, RoleAssignment, TaskResult,
 };
 
 const CREW_DIR: &str = "/home/agent/crew";
@@ -68,7 +68,7 @@ pub(super) fn run_task_command(args: &[String]) -> std::io::Result<i32> {
 fn print_task_help() {
     eprintln!("usage:");
     eprintln!(
-        "  herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles orchestrator=K,planner=K,implementer=K,qc=K]"
+        "  herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--mcp NAME]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles orchestrator=K,planner=K,implementer=K,qc=K]"
     );
     eprintln!("  herdr task goal <slug> <text> [--no-watch] [--report-only]");
     eprintln!("  herdr task watch <slug>");
@@ -82,6 +82,13 @@ fn print_task_help() {
     eprintln!("Model override precedence: flags, then HERDR_TASK_CLAUDE_MODEL,");
     eprintln!(
         "HERDR_TASK_CODEX_MODEL, HERDR_TASK_PI_PROVIDER, HERDR_TASK_PI_MODEL, then kit defaults."
+    );
+    eprintln!(
+        "--mcp NAME attaches a static MCP server already registered on this host (sbx mcp add);"
+    );
+    eprintln!(
+        "{} (comma-separated) is the default when no --mcp is given.",
+        tasks::MCP_ENV_VAR
     );
     eprintln!("Requires the sbx CLI and one-time `sbx setup ssh`. The kit reference");
     eprintln!(
@@ -360,7 +367,7 @@ fn accept_completed_run(
 fn task_new(args: &[String]) -> std::io::Result<i32> {
     let Some(slug) = args.first().cloned() else {
         eprintln!(
-            "usage: herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles ...]"
+            "usage: herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--mcp NAME]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles ...]"
         );
         return Ok(2);
     };
@@ -374,12 +381,13 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
     let mut roles_arg = None;
     let mut models = tasks::ModelOverrides::default();
     let mut mixins: Vec<String> = Vec::new();
+    let mut mcp_flags: Vec<String> = Vec::new();
     let mut index = 1;
     while index < args.len() {
         let (option, value) = (args[index].as_str(), args.get(index + 1));
         match option {
-            "--dir" | "--kit" | "--roles" | "--mixin" | "--claude-model" | "--codex-model"
-            | "--pi-provider" | "--pi-model" => {
+            "--dir" | "--kit" | "--roles" | "--mixin" | "--mcp" | "--claude-model"
+            | "--codex-model" | "--pi-provider" | "--pi-model" => {
                 let Some(value) = value else {
                     eprintln!("missing value for {option}");
                     return Ok(2);
@@ -388,6 +396,7 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
                     "--dir" => dir = Some(value.clone()),
                     "--kit" => kit = Some(value.clone()),
                     "--mixin" => mixins.push(value.clone()),
+                    "--mcp" => mcp_flags.push(value.clone()),
                     "--claude-model" => models.claude = Some(value.clone()),
                     "--codex-model" => models.codex = Some(value.clone()),
                     "--pi-provider" => models.pi_provider = Some(value.clone()),
@@ -413,6 +422,18 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
         Ok(args) => args,
         Err(err) => {
             eprintln!("invalid model override: {err}");
+            return Ok(2);
+        }
+    };
+    // Static MCP servers are host-registered resources referenced by name; a
+    // bad name stops here, before any sandbox is provisioned.
+    let mcps = match resolve_mcp_names(
+        &mcp_flags,
+        std::env::var(tasks::MCP_ENV_VAR).ok().as_deref(),
+    ) {
+        Ok(mcps) => mcps,
+        Err(err) => {
+            eprintln!("invalid MCP server: {err}");
             return Ok(2);
         }
     };
@@ -465,11 +486,20 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
     for mixin in &mixins {
         println!("  mixin:     {mixin}");
     }
+    for mcp in &mcps {
+        println!("  mcp:       {mcp}");
+    }
 
-    let argv = sbx_create_argv(&kit, &workspace, &slug, &roles, &mixins, &model_args);
+    let argv = sbx_create_argv(&kit, &workspace, &slug, &roles, &mixins, &mcps, &model_args);
     let exit_code = run_inherited(&argv)?;
     if exit_code != 0 {
         eprintln!("sbx create failed (exit {exit_code})");
+        if !mcps.is_empty() {
+            eprintln!(
+                "each --mcp NAME must already be registered on this host (`sbx mcp add`); \
+                 check the name(s) above"
+            );
+        }
         return Ok(1);
     }
 

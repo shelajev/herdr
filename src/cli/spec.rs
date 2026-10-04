@@ -338,6 +338,11 @@ fn task_command() -> Command {
                         .action(ArgAction::Append)
                         .help("Extra sbx mixin kit to stack onto the sandbox (repeatable)"),
                 )
+                .arg(
+                    option("mcp", "NAME")
+                        .action(ArgAction::Append)
+                        .help("Attach a host-registered static MCP server by name (repeatable; env default: HERDR_TASK_MCP, comma-separated)"),
+                )
                 .arg(option("claude-model", "ID").help("Claude model (env: HERDR_TASK_CLAUDE_MODEL)"))
                 .arg(option("codex-model", "ID").help("Codex model (env: HERDR_TASK_CODEX_MODEL)"))
                 .arg(option("pi-provider", "ID").help("pi provider (env: HERDR_TASK_PI_PROVIDER)"))
@@ -1101,6 +1106,28 @@ mod tests {
             );
             assert_eq!(goal.get_flag("no-watch"), flags.contains(&"--no-watch"));
         }
+    }
+
+    #[test]
+    fn task_new_accepts_repeated_mcp_names() {
+        let matches = super::task_command()
+            .try_get_matches_from([
+                "task",
+                "new",
+                "demo",
+                "--mcp",
+                "central-beans",
+                "--mcp",
+                "other",
+            ])
+            .expect("valid repeated --mcp");
+        let new = matches.subcommand_matches("new").expect("new command");
+        let values: Vec<&str> = new
+            .get_many::<String>("mcp")
+            .expect("mcp values")
+            .map(String::as_str)
+            .collect();
+        assert_eq!(values, ["central-beans", "other"]);
     }
 
     #[test]
