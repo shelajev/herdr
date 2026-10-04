@@ -302,6 +302,18 @@ describe("crew kit declaration", () => {
     expect(install).toContain("check_for_update_on_startup = false");
   });
 
+  test("trusts only the task workspace in Codex, never a blanket path", () => {
+    const step = spec.setup.install.find((entry: any) =>
+      entry.description.startsWith("Seed Codex trust"),
+    );
+    expect(step).toBeDefined();
+    expect(step.user).toBe("agent");
+    expect(step.command).toContain('ws="${WORKSPACE_DIR:-}"');
+    expect(step.command).toContain('trust_level = "trusted"');
+    expect(step.command).not.toContain('projects."/"');
+    expect(step.command).not.toContain("WORKSPACE_DIR:-/");
+  });
+
   test("hands the host the paths it reads back", () => {
     const paths = spec.setup.files.map((file: any) => file.path);
     expect(paths).toContain("/home/agent/crew/assignment");
