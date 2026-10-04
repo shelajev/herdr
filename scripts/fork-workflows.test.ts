@@ -311,11 +311,15 @@ describe("crew kit declaration", () => {
     );
     expect(step).toBeDefined();
     expect(step.user).toBe("agent");
-    // Ordered, validated candidates; never the step's own cwd (kits-v2 install
-    // commands start in the template WORKDIR).
+    // WORKSPACE_DIR is the single source; kits-v2 documents WORKDIR as the
+    // template workdir (also the install cwd), so neither it nor pwd is read.
     expect(step.command).toContain('raw="${WORKSPACE_DIR:-}"');
-    expect(step.command).toContain('raw="${WORKDIR:-}"');
+    expect(step.command).not.toContain("WORKDIR");
     expect(step.command).not.toContain("pwd");
+    // The trusted path must be the validated directory, and messages must not
+    // interpret backslash sequences from the path (sh's echo does).
+    expect(step.command).toContain('-ef "$raw"');
+    expect(step.command).not.toMatch(/\becho\b/);
     // Never the agent's home or its ancestors, nor a system root.
     expect(step.command).toContain("agent home directory or an ancestor");
     expect(step.command).toContain("/home | /tmp | /usr | /etc | /var | /root");

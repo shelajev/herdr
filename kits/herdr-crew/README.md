@@ -147,10 +147,12 @@ by running `herdr update`.
    Model preflight, a change goal, a report-only goal, an override, a rejected model
    and recovery after a resource grant must work before promotion. The same smoke
    must confirm which variable carries the runtime workspace path during install
-   steps: the Codex trust step tries `WORKSPACE_DIR`, then `WORKDIR`, and fails
-   when neither is a usable directory, because the
+   steps: the Codex trust step reads only `WORKSPACE_DIR` and fails loudly, never
+   guessing, when it is unset or not a usable directory. It ignores `WORKDIR`
+   because the
    [kits-v2 reference](https://docs.docker.com/ai/sandboxes/customize/kits-v2/)
-   says install commands start in the template WORKDIR, not the mounted project.
+   documents that as the template workdir, where install commands also start,
+   and it may differ from the mounted project.
 4. Only after that pair passes, move `:latest` and install the new driver together,
    with no old tasks in flight. Retain the previous host artifact for rollback.
 

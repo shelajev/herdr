@@ -269,66 +269,61 @@ setup:
     # unattended sandbox answers. Trust exactly the task workspace through the
     # per-project key Codex reads ([projects."<path>"] trust_level). This must
     # run after the config step above, which rewrites config.toml.
-    # kits-v2 install commands start in the template WORKDIR, not the mounted
-    # project (https://docs.docker.com/ai/sandboxes/customize/kits-v2/), so the
-    # workspace is never inferred from this step's cwd. It is taken from the
-    # first of WORKSPACE_DIR, WORKDIR that validates; which variable the
-    # runtime really sets during install is unverified until the host pair
-    # smoke. A candidate must be absolute, free of control characters, resolve
-    # (dot segments, symlinks; Codex keys trust by its canonical cwd) to a real
-    # directory, and not be "/", the agent's home directory or an ancestor of
-    # it (a template WORKDIR such as /home/agent is not the project), or one of
-    # /home /tmp /usr /etc /var /root. If none qualifies the step fails, so the
-    # sandbox never installs "successfully" with a Codex that would hang on the
-    # dialog. /home/agent/crew/workdir is not a source: setup.files appear to be
-    # written after setup.install.
+    # The workspace comes from WORKSPACE_DIR alone, the variable the Claude trust
+    # step above already uses. WORKDIR is deliberately ignored: kits-v2 documents
+    # it as the template workdir (/home/agent/workspace by default), which may
+    # differ from the mounted project
+    # (https://docs.docker.com/ai/sandboxes/customize/kits-v2/), and install
+    # commands also start there, so the step never infers the workspace from its
+    # cwd either. Whether the runtime really sets WORKSPACE_DIR during install is
+    # unverified until the host pair smoke; until then an unusable value fails
+    # the step rather than guessing. WORKSPACE_DIR must be absolute, free of
+    # control characters, resolve (dot segments, symlinks; Codex keys trust by
+    # its canonical cwd) to the same real directory, and not be "/", the agent's
+    # home directory or an ancestor of it, or one of /home /tmp /usr /etc /var
+    # /root (defence in depth, not workspace identity). Messages use printf '%s'
+    # because sh's echo interprets backslash sequences in a path.
     - command: |
         set -e
-        fail() { echo "herdr-crew: $*; cannot seed Codex trust for the task workspace" >&2; exit 1; }
-        resolve() {
-          ws=""
-          [ -n "$1" ] || { reason="is unset or empty"; return 1; }
-          case "$1" in
-            *[[:cntrl:]]*) reason="contains control characters"; return 1 ;;
-            /*) ;;
-            *) reason="is not an absolute path ('$1')"; return 1 ;;
-          esac
-          ws=$(readlink -f -- "$1") || { ws=""; reason="cannot be resolved ('$1')"; return 1; }
-          case "$ws" in
-            "" | /) ws=""; reason="resolves to the filesystem root ('$1')"; return 1 ;;
-            *[[:cntrl:]]*) ws=""; reason="resolves to a path with control characters ('$1')"; return 1 ;;
-          esac
-          [ -d "$ws" ] || { ws=""; reason="is not a directory ('$1')"; return 1; }
-          for h in /home/agent "$home"; do
-            [ -n "$h" ] || continue
-            case "$h/" in
-              "$ws"/*) ws=""; reason="is the agent home directory or an ancestor of it ('$1')"; return 1 ;;
-            esac
-          done
-          case "$ws" in
-            /home | /tmp | /usr | /etc | /var | /root) ws=""; reason="is a system directory ('$1')"; return 1 ;;
-          esac
+        fail() {
+          printf 'herdr-crew: %s; cannot seed Codex trust for the task workspace; the host pair smoke must confirm which variable carries the runtime workspace path during install\n' "$*" >&2
+          exit 1
         }
+        nl=$(printf '\nx')
+        nl=${nl%x}
+        raw="${WORKSPACE_DIR:-}"
+        [ -n "$raw" ] || fail "WORKSPACE_DIR is unset or empty"
+        case "$raw" in
+          *[[:cntrl:]]*) fail "WORKSPACE_DIR contains control characters" ;;
+          /*) ;;
+          *) fail "WORKSPACE_DIR is not an absolute path ('$raw')" ;;
+        esac
+        # The sentinel keeps command substitution from stripping a trailing
+        # newline that belongs to the resolved name; that newline is then seen
+        # by the control-character check instead of silently naming another
+        # directory.
+        ws=$(readlink -f -- "$raw" 2>/dev/null || :; printf x)
+        ws=${ws%x}
+        ws=${ws%"$nl"}
+        [ -n "$ws" ] || fail "WORKSPACE_DIR ('$raw') cannot be resolved (readlink -f failed or is missing)"
+        case "$ws" in
+          /) fail "WORKSPACE_DIR ('$raw') resolves to the filesystem root" ;;
+          *[[:cntrl:]]*) fail "WORKSPACE_DIR ('$raw') resolves to a path with control characters" ;;
+        esac
+        [ -d "$ws" ] || fail "WORKSPACE_DIR ('$raw') is not a directory"
+        # The trusted path must be the very directory that was validated.
+        [ "$ws" -ef "$raw" ] || fail "WORKSPACE_DIR ('$raw') does not resolve to the same directory as its canonical path"
         home=$(readlink -f -- "${HOME:-/home/agent}" 2>/dev/null) || home=""
-        ws=""
-        src=""
-        problems=""
-        for src in WORKSPACE_DIR WORKDIR; do
-          case "$src" in
-            WORKSPACE_DIR) raw="${WORKSPACE_DIR:-}" ;;
-            WORKDIR) raw="${WORKDIR:-}" ;;
+        for h in /home/agent "$home"; do
+          [ -n "$h" ] || continue
+          case "$h/" in
+            "$ws"/*) fail "WORKSPACE_DIR ('$raw') is the agent home directory or an ancestor of it" ;;
           esac
-          if resolve "$raw"; then
-            break
-          fi
-          problems="$problems $src $reason;"
         done
-        if [ -z "$ws" ]; then
-          problems=${problems# }
-          fail "no usable workspace (${problems%;})"
-        fi
-        [ -z "$problems" ] || echo "herdr-crew: skipped${problems%;}" >&2
-        echo "herdr-crew: seeding Codex trust for $ws (from $src)"
+        case "$ws" in
+          /home | /tmp | /usr | /etc | /var | /root) fail "WORKSPACE_DIR ('$raw') is a system directory" ;;
+        esac
+        printf '%s\n' "herdr-crew: seeding Codex trust for $ws (from WORKSPACE_DIR)"
         esc=$(printf '%s' "$ws" | sed 's/\\/\\\\/g; s/"/\\"/g')
         header="[projects.\"$esc\"]"
         if ! grep -qxF "$header" /home/agent/.codex/config.toml; then
