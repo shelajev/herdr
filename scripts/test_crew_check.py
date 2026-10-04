@@ -1,4 +1,5 @@
 """Exercise crew-check against stub tools and the kit's Codex trust seeding step."""
+import json
 import os
 from pathlib import Path
 import re
@@ -497,6 +498,175 @@ class CodexTrustSeedingTests(unittest.TestCase):
         self.assertEqual(parsed["model_providers"]["sandboxd"]["name"], "Sandbox Proxy")
         self.assertEqual(parsed["projects"][str(self.workspace)]["trust_level"], "trusted")
         self.assertEqual(parsed["approval_policy"], "never")
+
+
+class NativeMcpSeedingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.index, cls.command, cls.user = install_step(
+            "Seed native Claude and Codex MCP from the task-scoped gateway only"
+        )
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="crew-mcp-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.codex = self.home / ".codex"
+        self.codex.mkdir()
+        self.claude = self.home / ".claude.json"
+        self.config = self.codex / "config.toml"
+        self.existing_claude = {
+            "bypassPermissionsModeAccepted": True,
+            "hasCompletedOnboarding": True,
+            "projects": {"/task": {"hasTrustDialogAccepted": True}},
+            "oauthAccount": {"accountUuid": "fixture-account"},
+            "mcpServers": {"existing": {"type": "http", "url": "https://example.test/mcp"}},
+        }
+        self.existing_codex = (
+            'approval_policy = "on-request"\nsandbox_mode = "read-only"\n'
+            'model = "existing-model"\n'
+            '[model_providers.existing]\nname = "Existing Provider"\n'
+            '[projects."/task"]\ntrust_level = "trusted"\n'
+            '[mcp_servers.existing]\nurl = "https://example.test/mcp"\n'
+        )
+        self.claude.write_text(json.dumps(self.existing_claude))
+        self.config.write_text(self.existing_codex)
+        self.auth = self.codex / "auth.json"
+        self.auth.write_text('{"fixture": "existing-auth"}\n')
+
+    def seed(self, url="http://mcp-gateway.docker.internal/mcp", command=None, mode=None):
+        env = dict(os.environ)
+        env.pop("MCP_GATEWAY_URL", None)
+        if url is not None:
+            env["MCP_GATEWAY_URL"] = url
+        if mode is not None:
+            env["SBX_CRED_ANTHROPIC_MODE"] = mode
+            env["SBX_CRED_OPENAI_MODE"] = mode
+        return subprocess.run(
+            ["sh", "-c", (command or self.command).replace("/home/agent", str(self.home))],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+
+    def test_order_and_user(self):
+        trust_index, _, _ = install_step("Seed Codex trust for the task workspace only")
+        self.assertGreater(self.index, trust_index)
+        self.assertEqual(self.user, "agent")
+
+    def test_preserves_existing_configs_auth_and_private_modes(self):
+        result = self.seed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        claude = json.loads(self.claude.read_text())
+        native = claude["mcpServers"].pop("central-beans")
+        self.assertEqual(claude, self.existing_claude)
+        self.assertEqual(native, {"type": "http", "url": "http://mcp-gateway.docker.internal/mcp"})
+        parsed = tomllib.loads(self.config.read_text())
+        self.assertEqual(parsed["mcp_servers"].pop("central-beans"), {"url": native["url"]})
+        self.assertEqual(parsed, tomllib.loads(self.existing_codex))
+        self.assertTrue(self.config.read_text().startswith(self.existing_codex))
+        self.assertEqual(self.auth.read_text(), '{"fixture": "existing-auth"}\n')
+        for path in (self.claude, self.config):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.stat().st_uid, os.getuid())
+
+    def test_empty_and_absent_gateway_are_exact_noops(self):
+        for url in (None, ""):
+            original = (self.claude.read_bytes(), self.config.read_bytes())
+            result = self.seed(url)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(original, (self.claude.read_bytes(), self.config.read_bytes()))
+            self.claude.unlink()
+            self.config.unlink()
+            self.assertEqual(self.seed(url).returncode, 0)
+            self.assertFalse(self.claude.exists())
+            self.assertFalse(self.config.exists())
+            self.claude.write_bytes(original[0])
+            self.config.write_bytes(original[1])
+
+    def test_fresh_configs_and_idempotency(self):
+        self.claude.unlink()
+        self.config.unlink()
+        for _ in range(3):
+            result = self.seed()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(json.loads(self.claude.read_text())["mcpServers"]), ["central-beans"])
+        self.assertEqual(self.config.read_text().count("[mcp_servers.central-beans]"), 1)
+
+    def test_serializes_url_without_code_or_toml_injection(self):
+        url = 'https://example.test/mcp/"\\payload'
+        result = self.seed(url)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.claude.read_text())["mcpServers"]["central-beans"]["url"], url)
+        self.assertEqual(tomllib.loads(self.config.read_text())["mcp_servers"]["central-beans"]["url"], url)
+
+    def test_rejects_invalid_urls_without_writes_or_echoing_values(self):
+        original = (self.claude.read_bytes(), self.config.read_bytes())
+        for url in ("file:///etc/passwd", "http://", "https://host:invalid/mcp",
+                    "http://host/mcp\nmalicious", "http://host/mcp\x81", "http://host/white space",
+                    "https://user:secret@host/mcp", "https://host/mcp?token=secret",
+                    "https://host/mcp#secret"):
+            with self.subTest(url=url):
+                result = self.seed(url)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(url, result.stdout + result.stderr)
+                self.assertNotIn("secret", result.stdout + result.stderr)
+                self.assertEqual(original, (self.claude.read_bytes(), self.config.read_bytes()))
+
+    def test_malformed_and_conflicting_configs_fail_before_either_write(self):
+        cases = (
+            ("not json", self.existing_codex),
+            ('{"mcpServers": null}', self.existing_codex),
+            ("[]", self.existing_codex),
+            (json.dumps(self.existing_claude), "not toml"),
+            (json.dumps(self.existing_claude), self.existing_codex + '[mcp_servers.central-beans]\nurl = "https://other.test/mcp"\n'),
+            ('{"mcpServers":{"central-beans":{"type":"stdio","command":"other"}}}', self.existing_codex),
+        )
+        for claude, codex in cases:
+            self.claude.write_text(claude)
+            self.config.write_text(codex)
+            result = self.seed()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.claude.read_text(), claude)
+            self.assertEqual(self.config.read_text(), codex)
+
+    def test_refuses_symlink_without_reading_or_changing_target(self):
+        target = self.home / "untouched"
+        target.write_text("private fixture")
+        for path in (self.claude, self.config):
+            original = path.read_bytes()
+            path.unlink()
+            path.symlink_to(target)
+            result = self.seed()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_text(), "private fixture")
+            path.unlink()
+            path.write_bytes(original)
+            self.assertEqual(self.config.read_text(), self.existing_codex)
+            self.assertEqual(json.loads(self.claude.read_text()), self.existing_claude)
+        self.config.unlink()
+        self.auth.unlink()
+        self.codex.rmdir()
+        self.codex.symlink_to(self.home, target_is_directory=True)
+        result = self.seed()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target.read_text(), "private fixture")
+        self.assertEqual(json.loads(self.claude.read_text()), self.existing_claude)
+
+    def test_baseline_seeding_preserves_existing_configs(self):
+        settings_dir = self.home / ".claude"
+        settings_dir.mkdir()
+        settings = settings_dir / "settings.json"
+        settings.write_text('{"model":"existing","apiKeyHelper":"existing-helper"}\n')
+        for mode in ("none", "oauth", "apikey"):
+            for description in ("Seed Claude bypass/trust flags",
+                                "Seed Claude settings.json from SBX_CRED_ANTHROPIC_MODE",
+                                "Seed Codex config/auth from SBX_CRED_OPENAI_MODE"):
+                _, command, _ = install_step(description)
+                result = self.seed(command=command, mode=mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.claude.read_text()), self.existing_claude)
+        self.assertEqual(self.config.read_text(), self.existing_codex)
+        self.assertEqual(self.auth.read_text(), '{"fixture": "existing-auth"}\n')
+        self.assertEqual(settings.read_text(), '{"model":"existing","apiKeyHelper":"existing-helper"}\n')
 
 
 if __name__ == "__main__":

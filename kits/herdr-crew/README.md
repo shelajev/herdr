@@ -1,6 +1,6 @@
 # herdr-crew: task crews in Docker Sandboxes
 
-This page describes the **unpublished candidate** host driver and kit. Existing
+This page describes the task host driver and **0.5.2 candidate kit**. Existing
 sandboxes keep the kit and template they were created with. The dated inventory
 and promotion steps below explain what must change before these instructions
 apply to a newly created task.
@@ -62,7 +62,7 @@ template is rebuilt.
   the baseline network allowlist.
 - **Template image** (`template/Dockerfile`, candidate default
   `docker.io/olegselajev241/herdr-crew:0.5.1`, published for linux/arm64 with digest
-  `sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`; the kit is not published yet): herdr + Claude
+  `sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`): herdr + Claude
   Code + Codex + pi + beans + a pinned Node.js 22.22.1 baked in so sandbox creation
   is fast; `crew-entry` supervises the headless herdr server.
 - **Crew files** (`/home/agent/crew/` in the sandbox): `assignment`,
@@ -109,17 +109,19 @@ at all.
 
 ### Dated installed-state inventory
 
-This source tree is kit version **0.5.1**, a corrected candidate whose kit is not
-published yet. Kit and image 0.5.0 are published and immutable; they ship Node.js
+This source tree is kit version **0.5.2**. It adds native Claude Code and Codex
+configuration for the task-scoped MCP gateway without changing role, model or
+skill defaults. It reuses the immutable published ARM64 template image 0.5.1;
+it does not rebuild or overwrite image or kit versions 0.5.0 or 0.5.1.
+Kit and image 0.5.0 are published and immutable; they ship Node.js
 20.19.4, below the floors of Claude Code 2.1.289 (>=22) and pi 0.85.1 (>=22.19),
 and their Codex start stops at the workspace trust dialog. The host has since
 published the corrected linux/arm64 image as
 `docker.io/olegselajev241/herdr-crew:0.5.1` (digest
 `sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`), built from the
 independently reviewed Node component at commit `616d9593`. The only later change
-under `template/` is comment text in `crew-check`. No `latest` tag and no installed
-default has changed, and publishing the kit and promoting it are separate host
-steps. The host inventory
+under `template/` is comment text in `crew-check`. Publishing a versioned kit and
+promoting the default are separate host steps. The host inventory
 recorded on 2026-10-03 lists host task driver 0.8.2 and published kit 0.4.5
 (`docker.io/olegselajev241/herdr-crew-kit:latest`, also `:0.4.5`). These are dated
 observations, not a claim about what a mutable registry tag resolves to later.
@@ -129,7 +131,7 @@ old role protocol: no run.json/qc.json and no automatic three-model preflight.
 Its installed CLIs are Claude Code 2.1.289, Codex 0.153.4 and pi 0.85.1. Fresh
 isolated probes verified the candidate pins on those CLIs. That does not mean
 earlier crew work ran on those pins, or that this sandbox runs the rebuilt
-template. This source work has not installed a new host driver or released a kit.
+template. Source edits do not install a host driver or release a kit.
 
 ### Candidate promotion requirements
 
@@ -138,8 +140,8 @@ and kit; existing sandboxes keep their old files. Build the fork driver from the
 reviewed commit and record its checksum. Do not install it over an upstream build
 by running `herdr update`.
 
-1. Confirm the intended kit tag, 0.5.1, is unused. Never overwrite `:0.4.5` or
-   `:0.5.0` or reuse any published version tag.
+1. Confirm the intended kit tag, 0.5.2, is unused. Never overwrite `:0.4.5`,
+   `:0.5.0` or `:0.5.1`, or reuse any published version tag.
 2. The corrected linux/arm64 template is published as
    `docker.io/olegselajev241/herdr-crew:0.5.1` with digest
    `sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`; this is the candidate
@@ -175,8 +177,8 @@ Tasks run from published kits. For the host's later staging step, from this
 repository root and only after confirming the version tag is unused:
 
 ```bash
-sbx kit push ./kits/herdr-crew docker.io/olegselajev241/herdr-crew-kit:0.5.1
-export HERDR_TASK_KIT=docker.io/olegselajev241/herdr-crew-kit:0.5.1
+sbx kit push ./kits/herdr-crew docker.io/olegselajev241/herdr-crew-kit:0.5.2
+export HERDR_TASK_KIT=docker.io/olegselajev241/herdr-crew-kit:0.5.2
 ```
 
 These are publication instructions, not actions performed by this change. Only `task new`
@@ -186,9 +188,9 @@ are in [fork compatibility](../../docs/fork-compatibility.md).
 
 ## Per task
 
-Use these commands only after the host has published the candidate kit. Until
-`:latest` is promoted, export `HERDR_TASK_KIT` with that tested version reference
-as shown above; otherwise `task new` resolves `:latest`, not local kit files.
+Use these commands with a published, tested kit. Export `HERDR_TASK_KIT` with
+that version reference as shown above to select it explicitly; otherwise
+`task new` resolves `:latest`, not local kit files.
 Keep `$HERDR` set to the built fork driver. If `CARGO_TARGET_DIR` is set, use its
 release binary path instead of `$PWD/target/release/herdr`.
 
@@ -210,8 +212,12 @@ cd ~/src/some-project
 "$HERDR" task rm fix-login
 ```
 
-Task creation always passes `--skills off`: no host shared skill store is
-mounted. Crew-installed skills stay in the sandbox unless explicitly installed
+The host configuration authority (driver `f3098b71`) passes `--skills off` on
+every creation, and the host setting `skills.defaultMode` is `off`. These are
+host-owned configuration facts, separate from the observed absence of `/skills`
+mounts inside the sandbox: `sbx inspect` exposes no skills mode field, so mount
+absence alone cannot establish that mode. No host shared skill store is projected
+by this configuration. Crew-installed skills stay in the sandbox unless explicitly installed
 into the mounted project. Use a standalone clone: linked worktrees whose Git
 metadata lives outside the mount are rejected.
 
@@ -222,6 +228,67 @@ Mixins install as root inside the sandbox, so treat a mixin reference as code
 you're choosing to run. The `--mixin` example above needs the
 `kit.allowedSources` setting from the host setup section; without it sbx
 rejects a git-hosted kit.
+
+## Native task-scoped MCP
+
+With candidate kit 0.5.2 selected, attach the host-approved MCP server at task
+creation from the project's directory on the host:
+
+```bash
+"$HERDR" task new backlog-work --mcp central-beans
+```
+
+The sandbox engine supplies `MCP_GATEWAY_URL` for the task-scoped gateway and
+`MCP_SENTINEL_TOKEN_NAME` as names-only proxy metadata (observed name:
+`proxy-managed`). The kit reads only the gateway URL and fixed sandbox-local
+client config paths; it does not look up a token, copy host credentials, inspect
+host MCP configs or add a broader network capability. A missing or empty
+`MCP_GATEWAY_URL` makes the MCP install step a no-op, with no MCP config added.
+
+For a non-empty HTTP(S) URL, installation adds Claude Code's native user-scope
+entry in `/home/agent/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "central-beans": {
+      "type": "http",
+      "url": "http://mcp-gateway.docker.internal/mcp"
+    }
+  }
+}
+```
+
+It also adds Codex's native streamable HTTP table in
+`/home/agent/.codex/config.toml`:
+
+```toml
+[mcp_servers.central-beans]
+url = "http://mcp-gateway.docker.internal/mcp"
+```
+
+These examples show the observed engine URL, not a hardcoded fallback. Existing
+Claude keys (including bypass/trust, projects and OAuth data), Codex settings
+(including trust, approval policy, sandbox mode and model providers), other MCP
+servers and credential files are retained. Baseline seeding initializes missing
+files instead of overwriting existing configs; the existing workspace trust step
+still adds trust for the task workspace only. MCP writes use private files owned
+by `agent`. Invalid URLs, symlinked config paths, malformed configs or a conflicting
+`central-beans` entry fail installation without writing MCP config or printing its
+contents. URLs with embedded credentials, query strings or fragments are rejected.
+An identical existing entry is safe to seed again.
+
+Inside the sandbox, check native discovery with `claude mcp get central-beans`,
+`codex mcp list` and `codex mcp get central-beans`, then ask the assigned native
+client to call `get_task` and `list_tasks`. A discovery listing alone does not
+prove tool invocation, and an HTTP probe is not native-client evidence.
+
+Pi 0.85.1 has no native MCP support observed in this environment. When pi needs
+backlog data, the orchestrator assigns an MCP-capable crew member (Claude or
+Codex) to call the tools and relay the result, including the task id and returned
+version, through the existing crew handoff. Pi does not drive another member
+itself. This kit neither claims native pi integration nor installs arbitrary MCP
+packages or extra kits to provide it.
 
 ## Model defaults and overrides
 
