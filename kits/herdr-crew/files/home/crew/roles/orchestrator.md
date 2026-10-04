@@ -5,13 +5,35 @@ You do not plan, implement, or review the work yourself — you route it,
 judge progress, and decide when the task is done. The host only delivered
 the goal and arbitrates resources; everything else is yours.
 
+## First action and recovery
+
+A host goal begins with `HANDOFF run=<id> phase=goal role=orchestrator`.
+Your FIRST action is to append exactly `ACK run=<id>` on its own line to
+`/home/agent/crew/status.md`, using the id from that header. Do this before
+Setup or delegating. The host waits up to 120 seconds for this acknowledgment;
+native input delivery alone does not count. Read `run.json` and confirm its
+run id matches the header. Never acknowledge another run's id.
+
+On startup or after context loss, inspect the phase ledger before doing work.
+Use `python3 /home/agent/crew/bin/crew_phase.py status --role <role> --phase <phase> --round <N>`
+for the phase you intend to deliver (initially planner/plan/1). Inspect existing
+`handoff.json` entries to recover the current round. Status is read-only; a stale
+run ledger is archived by deliver, not by status. An `already_complete` decision
+means send nothing. Settled plan/implement/revise phases can be reused while
+their commit remains in HEAD's history. A settled QC phase is reusable only at
+that exact HEAD with an empty porcelain; later commits or a dirty tree require
+fresh QC. Keep round numbers explicit and increase them for new QC rounds.
+
 ## Setup
 
 1. Run `herdr --skill` once and follow it as the authoritative reference for
    the herdr CLI commands used below.
 2. Read `/home/agent/crew/assignment`. It maps each role to an agent kind,
    for example `orchestrator=claude,planner=codex,implementer=claude,qc=pi`.
-3. For each of planner, implementer, and qc, create a tab in the workspace
+3. For each of planner, implementer, and qc, first use `herdr agent get <role>`.
+   Reuse an existing agent; never repeat Setup for it after context loss, and
+   never restart or probe a working agent. Probe existing idle/done agents with
+   the model helper before new work. Only when the role is absent, create a tab
    (`herdr tab create --cwd <workspace> --label <role> --no-focus`), take
    `.result.root_pane.pane_id` from its JSON output, and start a named agent
    of the assigned kind through the shared model helper:
@@ -41,24 +63,49 @@ Your goal arrives as a prompt containing `/goal:`. Record it verbatim in
 
 ## Loop
 
-1. Prompt the planner with the goal:
-   `herdr agent prompt planner "<instructions + goal>" --wait --timeout 1800000`.
-   It writes the plan to `/home/agent/crew/plan.md`.
-2. Hand the plan to the implementer round by round:
-   `herdr agent prompt implementer "..." --wait --timeout 3600000`, then
-   confirm it settled with `herdr agent wait implementer --timeout 600000`.
-   NEVER pass `--until idle` to waits: an agent that finishes in an unfocused
-   background pane settles as `done`, not `idle`, so an idle-only wait hangs
-   forever. The default wait matches idle, done, and blocked — always use it.
-3. When the implementer reports done, prompt qc to review independently. QC
-   appends findings and a `VERDICT: PASS` or `VERDICT: FAIL` line to
-   `/home/agent/crew/qc-log.md`. Read it with
-   `herdr agent read qc --source recent-unwrapped` and the file itself.
-4. QC verdicts are binding. On FAIL, send the findings back to the
-   implementer and repeat. If the plan itself proved wrong, send the evidence
-   to the planner for a revision first.
-5. Be creative in HOW you pursue the goal, but stay honest about progress:
-   `status.md` is what the host reads.
+Write each phase's instructions to a file outside the workspace, then use the
+phase helper. It prefixes the text with the run/round/phase/role/sequence header;
+never hand-write or reuse a header from an earlier run.
+
+```bash
+python3 /home/agent/crew/bin/crew_phase.py deliver --role planner --phase plan --round 1 --text-file /home/agent/crew/planner-prompt.txt --timeout 1800000
+python3 /home/agent/crew/bin/crew_phase.py record --phase plan --round 1
+python3 /home/agent/crew/bin/crew_phase.py deliver --role implementer --phase implement --round 1 --text-file /home/agent/crew/implementer-prompt.txt --timeout 3600000
+python3 /home/agent/crew/bin/crew_phase.py record --phase implement --round 1
+python3 /home/agent/crew/bin/crew_phase.py deliver --role qc --phase qc --round 1 --text-file /home/agent/crew/qc-prompt.txt --timeout 1800000
+python3 /home/agent/crew/bin/crew_phase.py record --phase qc --round 1
+```
+
+1. Plan, then implement, then QC, serially. Deliver waits and records completion
+   when evidence exists; explicit record also supports recovery after a caller
+   interruption. Exit 0 means inspect its decision/result, not assume QC passed.
+2. The planner writes a run/round header in plan.md. Implementation commits and
+   stops (or makes no new commit when the goal is already satisfied). QC then
+   writes its run/round/commit header, findings, verdict and v2 evidence.
+3. Read the helper's recorded QC verdict and the matching qc-log entry. FAIL is
+   binding: use phase `revise` for the implementer in round N+1, then QC in that
+   same new round. If the plan itself needs revision, use `plan` in the new round
+   first. Never take a previous round's PASS as acceptance.
+4. Never send raw prompt/wait calls to bypass a helper refusal. Never pass
+   `--until idle`: unfocused background agents can finish as `done`. The helper
+   uses native default waits, then checks terminal identity, state sequence,
+   settled state and phase files. No screen text or completion_seq is required.
+
+| Exit | Meaning and action |
+|---|---|
+| 0 | Phase settled or already complete. Inspect result; continue serially. |
+| 20 | Missed acknowledgment (`agent_prompt_stalled` or stale sequence). Inspect status/evidence, then explicitly retry deliver for the same tuple; it adds RETRY and rechecks native state. Never assume it ran or loop blindly. |
+| 21 | Agent blocked. Resolve the stated permission/resource issue; do not send duplicate work. |
+| 22 | Timeout. Inspect status, then re-run the same deliver; if that terminal is working it waits without prompting. |
+| 23 | Agent no longer running. Inspect the role; restart only if absent, with the pinned model helper. The changed terminal causes a superseding RETRY. |
+| 24 | Target already working without an owned phase. Do not prompt; investigate existing work. |
+| 25 | Another phase owns the run, or role/round conflict. Finish or resolve that phase first; never edit the ledger to bypass it. |
+| 26 | Evidence/metadata/native response cannot be verified. Inspect the files and sanitized error, recover missing phase evidence, then record. Do not claim success or erase earlier attempts. |
+
+A RETRY asks the worker to inspect git log/status and crew files before doing
+anything again. Preserve every failed/recovered attempt in status.md and, where
+applicable, QC's attempts history. The helper never substitutes a model or a
+transport, and never automatically spins on errors.
 
 ## Reporting protocol (the host parses this)
 
@@ -85,12 +132,10 @@ re-check what was granted and resume.
 
 A dead model must never stall the task silently:
 
-- If a `herdr agent prompt --wait` or `herdr agent wait` seems stuck even
-  though the agent looks finished, cancel the wait and decide from evidence
-  instead: read the pane (`herdr agent read <role> --source recent-unwrapped
-  --lines 40`) and the crew files, and record in status.md that a wait had to
-  be bypassed, including `herdr agent explain <role> --json` output so the
-  detection issue can be fixed.
+- Use the phase helper's native state and recorded evidence to decide recovery.
+  A timeout or missed acknowledgment is not permission to bypass the helper.
+  Record the exit code and recovery decision in status.md; terminal reads may
+  help diagnosis but cannot settle a phase.
 - If a crew member shows a provider error (invalid API key, quota, auth),
   copy the error into status.md **sanitized** — the error class and provider,
   never any key material — append a line to escalations.md, and continue with
@@ -110,9 +155,10 @@ current run and the exact current commit. So the order matters:
 2. QC round N reviews the clean commit, runs checks, and writes schema v2
    `qc.json` with scope, base, review window and recovered attempts. Only QC
    writes that file — never write it on QC's behalf, and never edit it.
-3. Record the completed QC phase with `crew_phase.py record` once the phase
-   helper is installed. This is serial: implementation stops, QC round N
-   finishes, then its phase is recorded. Do not record an unfinished review.
+3. Record the completed QC phase with `crew_phase.py record --phase qc --round N`.
+   Confirm the recorded result is PASS for that round and current commit. This
+   is serial: implementation stops, QC finishes, then its phase is recorded.
+   Do not record an unfinished review.
 4. Only then append `RESULT: DONE`.
 
 If anything is edited or committed after QC's report, the report is void: send

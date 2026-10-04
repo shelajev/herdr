@@ -28,6 +28,9 @@ const DEFAULT_WORKSPACE_DIR: &str = "/home/agent/workspace";
 /// that an independent reviewer accepted its current commit. Distinct from
 /// BLOCKED (3) so automation can tell "needs resources" from "not reviewed".
 const EXIT_UNACCEPTED: i32 = 4;
+/// Native delivery succeeded but the orchestrator did not acknowledge this run.
+const EXIT_UNACKNOWLEDGED: i32 = 6;
+const GOAL_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn run_task_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -130,6 +133,28 @@ fn ssh_capture(host: &str, remote_command: &str) -> std::io::Result<RemoteOutput
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// ACK polling must bound the SSH read too, not just the delay between polls.
+fn read_goal_ack(host: &str, timeout: Duration) -> std::io::Result<String> {
+    let child = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            host,
+            "cat /home/agent/crew/status.md",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let output = crate::remote::wait_with_output_timeout(child, timeout)?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            "could not read the goal acknowledgment",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn ssh_herdr_json(
@@ -573,6 +598,41 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
         return Ok(1);
     }
 
+    // Check before minting metadata: an old active turn must not be mistaken
+    // for acknowledgment of a new parallel goal. This does not preserve runs.
+    let orchestrator = match ssh_herdr_json(&host, &["agent", "get", "orchestrator"])? {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("cannot inspect the orchestrator: {err}");
+            return Ok(1);
+        }
+    };
+    let Some(orchestrator_status) = orchestrator
+        .pointer("/result/agent/agent_status")
+        .and_then(|v| v.as_str())
+    else {
+        eprintln!("cannot read the orchestrator's native status");
+        return Ok(1);
+    };
+    let status = match read_evidence_file(&host, "status.md")? {
+        Ok(value) => value.unwrap_or_default(),
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(1);
+        }
+    };
+    if tasks::goal_delivery_decision(orchestrator_status, tasks::current_run_slice(&status))
+        == tasks::GoalDeliveryDecision::Busy
+    {
+        let current_run = match read_evidence_file(&host, tasks::RUN_METADATA_FILE)? {
+            Ok(Some(raw)) => tasks::RunMetadata::parse(&raw).ok().map(|run| run.run_id),
+            _ => None,
+        }
+        .unwrap_or_else(|| "unknown".into());
+        eprintln!("run {current_run} is still in progress; use `herdr task watch {slug}`");
+        return Ok(1);
+    }
+
     // Mint this run's identity before every goal delivery. The QC report must
     // name this run id and this run's goal, so a report left behind by an
     // earlier run can never be mistaken for acceptance of this one. Discarding
@@ -607,12 +667,13 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
     let _ = ssh_capture(&host, &marker)?;
 
     let goal_prompt = format!(
-        "You are the crew orchestrator for this task. Read {CREW_DIR}/roles/orchestrator.md \
+        "HANDOFF run={} phase=goal role=orchestrator\nYou are the crew orchestrator for this task. Read {CREW_DIR}/roles/orchestrator.md \
          and follow it exactly: assemble the crew from {CREW_DIR}/assignment, coordinate \
          plan -> implement -> qc rounds until qc passes, record progress in \
          {CREW_DIR}/status.md, and finish by appending a final line \
          'RESULT: DONE', 'RESULT: FAILED', or 'RESULT: BLOCKED' to {CREW_DIR}/status.md. \
-         The workspace is {workdir}. /goal: {goal}"
+         The workspace is {workdir}. /goal: {goal}",
+        run.run_id
     );
     // Starting a TUI can briefly look idle before its final initialization
     // redraw. Confirm the prompt actually triggered work rather than treating
@@ -636,7 +697,24 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
         eprintln!("failed to deliver the goal: {err}");
         return Ok(1);
     }
-    println!("goal delivered to the sandboxed orchestrator.");
+    let ack_deadline = std::time::Instant::now() + GOAL_ACK_TIMEOUT;
+    loop {
+        let remaining = ack_deadline.saturating_duration_since(std::time::Instant::now());
+        match read_goal_ack(&host, remaining) {
+            Ok(status) if tasks::run_acknowledged(&status, &run.run_id) => break,
+            Err(_) => {
+                eprintln!("native goal delivery succeeded, but status.md could not be read to verify ACK run={}; inspect with `herdr task attach {slug}`", run.run_id);
+                return Ok(EXIT_UNACKNOWLEDGED);
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= ack_deadline {
+            eprintln!("native goal delivery succeeded, but ACK run={} was not observed in status.md within 120 seconds; inspect with `herdr task attach {slug}`", run.run_id);
+            return Ok(EXIT_UNACKNOWLEDGED);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    println!("goal delivered and acknowledged by the sandboxed orchestrator.");
     if !watch {
         println!("follow progress with: herdr task watch {slug}");
         return Ok(0);

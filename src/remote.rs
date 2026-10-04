@@ -2,6 +2,7 @@ mod args;
 mod attach;
 mod host;
 mod process;
+pub(crate) use process::wait_with_output_timeout;
 mod restart_policy;
 mod saved;
 #[cfg(unix)]

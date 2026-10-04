@@ -388,6 +388,32 @@ pub(crate) fn parse_result(status: &str) -> Option<TaskResult> {
     result
 }
 
+/// A busy unfinished turn cannot acknowledge a newly delivered parallel goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoalDeliveryDecision {
+    Deliver,
+    Busy,
+}
+
+pub(crate) fn goal_delivery_decision(
+    orchestrator_status: &str,
+    current_run: &str,
+) -> GoalDeliveryDecision {
+    if orchestrator_status == "working" && parse_result(current_run).is_none() {
+        GoalDeliveryDecision::Busy
+    } else {
+        GoalDeliveryDecision::Deliver
+    }
+}
+
+/// The ACK must be a whole line for this run, after the latest goal marker.
+pub(crate) fn run_acknowledged(status: &str, run_id: &str) -> bool {
+    let expected = format!("ACK run={run_id}");
+    current_run_slice(status)
+        .lines()
+        .any(|line| line.trim() == expected)
+}
+
 // ---------------------------------------------------------------------------
 // Completion evidence: a run is only accepted on machine-readable QC evidence
 // ---------------------------------------------------------------------------
@@ -1944,6 +1970,45 @@ mod tests {
             "herdr agent prompt planner 'do it; rm -rf /'"
         );
         assert_eq!(remote_command(&["echo", "it's"]), "echo 'it'\\''s'");
+    }
+
+    #[test]
+    fn goal_delivery_refuses_only_busy_unfinished_work() {
+        assert_eq!(
+            goal_delivery_decision("working", "planning"),
+            GoalDeliveryDecision::Busy
+        );
+        assert_eq!(
+            goal_delivery_decision("idle", "RESULT: BLOCKED"),
+            GoalDeliveryDecision::Deliver
+        );
+        for result in ["DONE", "FAILED", "BLOCKED"] {
+            assert_eq!(
+                goal_delivery_decision("working", &format!("RESULT: {result}")),
+                GoalDeliveryDecision::Deliver
+            );
+        }
+        assert_eq!(
+            goal_delivery_decision("done", "progress"),
+            GoalDeliveryDecision::Deliver
+        );
+    }
+
+    #[test]
+    fn acknowledgments_must_name_the_current_run_after_its_marker() {
+        assert!(run_acknowledged(
+            &format!("{GOAL_MARKER}\nACK run=current\n"),
+            "current"
+        ));
+        for status in [
+            format!("ACK run=current\n{GOAL_MARKER}\nACK run=old"),
+            "ACK run=current-other".into(),
+            "ACK run=old".into(),
+            "quoted ACK run=current".into(),
+            "ACK run=current extra".into(),
+        ] {
+            assert!(!run_acknowledged(&status, "current"), "{status}");
+        }
     }
 
     #[test]

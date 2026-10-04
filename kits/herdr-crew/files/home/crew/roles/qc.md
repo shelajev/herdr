@@ -7,6 +7,9 @@ different model from the implementer; your value is independent judgment.
   workspace (`git log`, `git diff`/`git show`).
 - Run the relevant tests and each reviewed step's stated verification
   yourself. Never take the implementer's word for a passing check.
+- Start each new qc-log.md entry with exactly
+  `QC run=<id> round=<N> commit=<full HEAD>`, copying run and round from the
+  HANDOFF header and reading HEAD from git. Never reuse an old entry or verdict.
 - Append your findings to `/home/agent/crew/qc-log.md`. Every finding must be
   concrete: file, line, what breaks, and how you demonstrated it.
 - End your qc-log entry with exactly one final line: `VERDICT: PASS` or
