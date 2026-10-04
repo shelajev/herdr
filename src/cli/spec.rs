@@ -244,6 +244,7 @@ fn task_command() -> Command {
                 .about("Provision a task sandbox with a rotated agent crew")
                 .arg(required("slug", "SLUG"))
                 .arg(path_option("dir", "PATH").help("Workspace directory (default: current)"))
+                .arg(option("bean", "ID").help("Central bean for durable task usage history"))
                 .arg(option("kit", "REF").help("herdr-crew kit reference"))
                 .arg(
                     option("mixin", "REF")
@@ -289,7 +290,19 @@ fn task_command() -> Command {
                 .arg(required("slug", "SLUG"))
                 .arg(option("allow", "DOMAIN").help("Allow a domain for this task's sandbox")),
         )
-        .subcommand(id_command("rm", "slug", "Remove a task sandbox"))
+        .subcommand(
+            Command::new("usage")
+                .about("Export native session token counters to durable host history")
+                .arg(required("slug", "SLUG"))
+                .arg(option("bean", "ID"))
+                .arg(option("run-id", "ID")),
+        )
+        .subcommand(
+            Command::new("rm")
+                .about("Export usage then remove a task sandbox")
+                .arg(required("slug", "SLUG"))
+                .arg(flag("skip-usage").help("Explicit shutdown: record unavailable final counters")),
+        )
 }
 
 // Fork-only: upstream moved its commands to shared contracts and dropped this
@@ -438,6 +451,21 @@ fn required(name: &'static str, value_name: &'static str) -> Arg {
 #[cfg(test)]
 mod tests {
     use clap::{Arg, Command};
+
+    #[test]
+    fn task_usage_and_shutdown_flags_parse() {
+        super::task_command()
+            .try_get_matches_from([
+                "task", "usage", "demo", "--bean", "bean-1", "--run-id", "run-1",
+            ])
+            .expect("usage identifiers parse");
+        super::task_command()
+            .try_get_matches_from(["task", "rm", "demo", "--skip-usage"])
+            .expect("explicit shutdown parses");
+        super::task_command()
+            .try_get_matches_from(["task", "new", "demo", "--bean", "bean-1"])
+            .expect("creation bean parses");
+    }
 
     #[test]
     fn task_goal_accepts_report_only_with_or_without_watch() {

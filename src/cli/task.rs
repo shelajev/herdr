@@ -9,6 +9,7 @@
 //! is never performed by the model that implemented the work; role rotation
 //! and that invariant live in `crate::tasks`.
 
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -46,6 +47,7 @@ pub(super) fn run_task_command(args: &[String]) -> std::io::Result<i32> {
         "watch" => task_watch(&args[1..]),
         "attach" => task_attach(&args[1..]),
         "policy" => task_policy(&args[1..]),
+        "usage" => task_usage(&args[1..]),
         "rm" | "remove" => task_rm(&args[1..]),
         "help" | "--help" | "-h" => {
             print_task_help();
@@ -77,6 +79,10 @@ fn print_task_help() {
     eprintln!("  herdr task attach <slug>");
     eprintln!("  herdr task policy <slug> [--allow DOMAIN]");
     eprintln!("  herdr task rm <slug>");
+    eprintln!("  herdr task usage <slug> [--bean ID] [--run-id ID]");
+    eprintln!(
+        "  new also accepts --bean ID; rm exports first (--skip-usage for explicit shutdown)"
+    );
     eprintln!();
     eprintln!("Tasks run in Docker SBX sandboxes provisioned from the herdr-crew kit.");
     eprintln!("Model override precedence: flags, then HERDR_TASK_CLAUDE_MODEL,");
@@ -384,6 +390,7 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
     let mut dir = None;
     let mut kit = None;
     let mut roles_arg = None;
+    let mut bean_id = None;
     let mut models = tasks::ModelOverrides::default();
     let mut mixins: Vec<String> = Vec::new();
     let mut mcp_flags: Vec<String> = Vec::new();
@@ -391,7 +398,7 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
     while index < args.len() {
         let (option, value) = (args[index].as_str(), args.get(index + 1));
         match option {
-            "--dir" | "--kit" | "--roles" | "--mixin" | "--mcp" | "--claude-model"
+            "--dir" | "--kit" | "--roles" | "--mixin" | "--mcp" | "--bean" | "--claude-model"
             | "--codex-model" | "--pi-provider" | "--pi-model" => {
                 let Some(value) = value else {
                     eprintln!("missing value for {option}");
@@ -399,6 +406,7 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
                 };
                 match option {
                     "--dir" => dir = Some(value.clone()),
+                    "--bean" => bean_id = Some(value.clone()),
                     "--kit" => kit = Some(value.clone()),
                     "--mixin" => mixins.push(value.clone()),
                     "--mcp" => mcp_flags.push(value.clone()),
@@ -505,6 +513,11 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
                  check the name(s) above"
             );
         }
+        return Ok(1);
+    }
+
+    if usage_archive("init", &slug, bean_id.as_deref(), None, Some(&workspace))? != 0 {
+        eprintln!("sandbox created but history registration failed; register with task usage before teardown");
         return Ok(1);
     }
 
@@ -818,6 +831,14 @@ fn watch_task(
         let status = read_crew_file(host, "status.md")?.unwrap_or_default();
         print_file_delta("status", &last_status, &status);
         last_status = status.clone();
+
+        // Snapshot while workers are alive, retaining earlier native sessions after restarts.
+        // Failures are visible but never change the crew's outcome or policy.
+        if usage_archive("capture-quiet", slug, None, None, None)? != 0 {
+            eprintln!(
+                "warning: usage snapshot unavailable; retry task usage before removing the sandbox"
+            );
+        }
 
         let escalations = read_crew_file(host, "escalations.md")?.unwrap_or_default();
         if print_file_delta("ESCALATION", &last_escalations, &escalations) {
@@ -1272,10 +1293,77 @@ fn task_rm(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{err}");
         return Ok(2);
     }
+    if args.len() > 2 || (args.len() == 2 && args[1] != "--skip-usage") {
+        eprintln!("usage: herdr task rm <slug> [--skip-usage]");
+        return Ok(2);
+    }
+    let skip = args.get(1).is_some_and(|v| v == "--skip-usage");
+    let command = if skip { "unavailable" } else { "capture" };
+    if usage_archive(command, slug, None, None, None)? != 0 && !skip {
+        eprintln!("sandbox preserved because export failed; retry task usage, or use --skip-usage for explicit shutdown");
+        return Ok(1);
+    }
     let argv: Vec<String> = ["sbx", "rm"]
         .iter()
         .map(|arg| arg.to_string())
         .chain(std::iter::once(sandbox_name(slug)))
         .collect();
-    run_inherited(&argv)
+    let result = run_inherited(&argv)?;
+    if result == 0 && usage_archive("closed", slug, None, None, None)? != 0 {
+        eprintln!("sandbox removed; history end timestamp could not be saved");
+    }
+    Ok(result)
+}
+
+fn usage_archive(
+    command: &str,
+    slug: &str,
+    bean: Option<&str>,
+    run_id: Option<&str>,
+    workspace: Option<&str>,
+) -> std::io::Result<i32> {
+    let request = serde_json::json!({
+        "command": command, "slug": slug, "bean_id": bean, "run_id": run_id,
+        "workspace": workspace, "collector": include_str!("task_usage.py")
+    });
+    let mut child = Command::new("python3")
+        .args(["-c", include_str!("task_usage_host.py")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("usage archive stdin unavailable"))?
+        .write_all(request.to_string().as_bytes())?;
+    Ok(child.wait()?.code().unwrap_or(1))
+}
+
+fn task_usage(args: &[String]) -> std::io::Result<i32> {
+    let Some(slug) = args.first() else {
+        eprintln!("usage: herdr task usage <slug> [--bean ID] [--run-id ID]");
+        return Ok(2);
+    };
+    if let Err(err) = validate_slug(slug) {
+        eprintln!("{err}");
+        return Ok(2);
+    }
+    let (mut bean, mut run_id) = (None, None);
+    let mut index = 1;
+    while index < args.len() {
+        let Some(value) = args.get(index + 1) else {
+            return Ok(2);
+        };
+        match args[index].as_str() {
+            "--bean" => bean = Some(value.as_str()),
+            "--run-id" => run_id = Some(value.as_str()),
+            other => {
+                eprintln!("unknown usage option: {other}");
+                return Ok(2);
+            }
+        }
+        index += 2;
+    }
+    usage_archive("capture", slug, bean, run_id, None)
 }
