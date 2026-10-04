@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: sandbox
 name: herdr-crew
-version: "0.5.1"
+version: "0.5.2"
 displayName: Herdr Crew
 description: |
   Task sandbox running a nested Herdr server and a crew of coding agents
@@ -18,7 +18,7 @@ sourceURL: https://github.com/shelajev/herdr
 args:
   image:
     default: docker.io/olegselajev241/herdr-crew:0.5.1
-    description: Herdr crew template image. The 0.5.1 default is published for linux/arm64 (digest sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f), but this kit version is still an unpublished candidate, and promotion waits for real sandbox acceptance; for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh
+    description: Published linux/arm64 Herdr crew template image (0.5.1, digest sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f); for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh
   roles:
     default: orchestrator=claude,planner=codex,implementer=claude,qc=pi
     description: Role assignment for this task; the host rotates this per task and guarantees qc differs from implementer
@@ -193,6 +193,8 @@ setup:
     # host-side credential state (oauth|apikey|none).
     - command: |
         set -e
+        [ ! -L /home/agent/.claude.json ] || exit 1
+        [ ! -e /home/agent/.claude.json ] || exit 0
         ws="${WORKSPACE_DIR:-/}"
         esc=$(printf '%s' "$ws" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g')
         projects="\"/\": { \"hasTrustDialogAccepted\": true }"
@@ -202,12 +204,15 @@ setup:
           \"hasCompletedOnboarding\": true,
           \"projects\": { $projects }
         }" > /home/agent/.claude.json
+        chmod 600 /home/agent/.claude.json
         chown agent:agent /home/agent/.claude.json
       user: "0"
       description: Seed Claude bypass/trust flags
     - command: |
         set -e
+        [ ! -L /home/agent/.claude ] && [ ! -L /home/agent/.claude/settings.json ] || exit 1
         mkdir -p /home/agent/.claude
+        [ ! -e /home/agent/.claude/settings.json ] || exit 0
         HELPER=''
         if [ "${SBX_CRED_ANTHROPIC_MODE:-none}" != none ]; then
           HELPER='  "apiKeyHelper": "echo proxy-managed",
@@ -225,8 +230,10 @@ setup:
       description: Seed Claude settings.json from SBX_CRED_ANTHROPIC_MODE
     - command: |
         set -e
+        [ ! -L /home/agent/.codex ] && [ ! -L /home/agent/.codex/config.toml ] && [ ! -L /home/agent/.codex/auth.json ] || exit 1
         mkdir -p /home/agent/.codex
         MODE="${SBX_CRED_OPENAI_MODE:-none}"
+        if [ ! -e /home/agent/.codex/config.toml ]; then
         cat > /home/agent/.codex/config.toml << 'EOF'
         approval_policy = "never"
         sandbox_mode = "danger-full-access"
@@ -250,6 +257,8 @@ setup:
         requires_openai_auth = false
         EOF
         fi
+        fi
+        if [ ! -e /home/agent/.codex/auth.json ]; then
         case "$MODE" in
           oauth|apikey)
             cat > /home/agent/.codex/auth.json << 'EOF'
@@ -262,6 +271,7 @@ setup:
             rm -f /home/agent/.codex/auth.json
             ;;
         esac
+        fi
       user: "agent"
       description: Seed Codex config/auth from SBX_CRED_OPENAI_MODE
     # Codex 0.153.4 blocks a fresh start in an untrusted directory behind a
@@ -331,6 +341,70 @@ setup:
         fi
       user: "agent"
       description: Seed Codex trust for the task workspace only
+    - command: |
+        set -e
+        [ -n "${MCP_GATEWAY_URL:-}" ] || exit 0
+        python3 - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+        import tempfile
+        import tomllib
+        from urllib.parse import urlsplit
+
+        def fail():
+            raise SystemExit("herdr-crew: invalid gateway or conflicting native MCP config; no MCP config written")
+
+        url = os.environ["MCP_GATEWAY_URL"]
+        try:
+            endpoint = urlsplit(url)
+            port = endpoint.port
+            if (endpoint.scheme not in ("http", "https") or not endpoint.hostname
+                    or endpoint.username is not None or endpoint.password is not None
+                    or endpoint.query or endpoint.fragment
+                    or any(character.isspace() or not character.isprintable() for character in url)):
+                fail()
+            home = Path("/home/agent")
+            claude_path = home / ".claude.json"
+            codex_dir = home / ".codex"
+            codex_path = codex_dir / "config.toml"
+            if any(path.is_symlink() for path in (home, claude_path, codex_dir, codex_path)):
+                fail()
+            claude = json.loads(claude_path.read_text()) if claude_path.exists() else {}
+            servers = claude.setdefault("mcpServers", {})
+            desired = {"type": "http", "url": url}
+            if "central-beans" in servers and servers["central-beans"] != desired:
+                fail()
+            servers["central-beans"] = desired
+            codex_text = codex_path.read_text() if codex_path.exists() else ""
+            codex = tomllib.loads(codex_text)
+            codex_servers = codex.get("mcp_servers", {})
+            if "central-beans" in codex_servers:
+                if codex_servers["central-beans"] != {"url": url}:
+                    fail()
+            else:
+                codex_text += '\n[mcp_servers.central-beans]\nurl = ' + json.dumps(url) + '\n'
+                tomllib.loads(codex_text)
+        except (ValueError, TypeError, AttributeError, OSError):
+            fail()
+
+        def write_private(path, content):
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
+                    temporary = Path(output.name)
+                    output.write(content)
+                temporary.replace(path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+
+        codex_dir.mkdir(mode=0o700, exist_ok=True)
+        write_private(claude_path, json.dumps(claude, indent=2) + "\n")
+        write_private(codex_path, codex_text)
+        PY
+      user: "agent"
+      description: Seed native Claude and Codex MCP from the task-scoped gateway only
   startup:
     # The sandbox entrypoint (crew-entry) only runs when someone attaches, so
     # a detached task sandbox needs the herdr server started as a boot
