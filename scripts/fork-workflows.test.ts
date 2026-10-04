@@ -186,6 +186,26 @@ describe("crew kit declaration", () => {
   const kitUrl = new URL("../kits/herdr-crew/spec.yaml", import.meta.url);
   const spec: any = Bun.YAML.parse(readFileSync(kitUrl, "utf8"));
 
+  test("pins all crew starts from one models file", () => {
+    expect(spec.args.claude_model.default).toBe("claude-opus-5-5");
+    expect(spec.args.codex_model.default).toBe("gpt-6.1-sol");
+    expect(spec.args.pi_provider.default).toBe("google");
+    expect(spec.args.gemini_model.default).toBe("gemini-3.8-flash");
+    expect(spec.environment.variables.HERDR_CREW_CLAUDE_MODEL).toBe("${{ kit.args.claude_model }}");
+    expect(spec.environment.variables.HERDR_CREW_CODEX_MODEL).toBe("${{ kit.args.codex_model }}");
+    expect(spec.environment.variables.HERDR_CREW_PI_PROVIDER).toBe("${{ kit.args.pi_provider }}");
+    const models = spec.setup.files.find((file: any) => file.path === "/home/agent/crew/models");
+    expect(models.content).toBe("claude=${{ kit.args.claude_model }},codex=${{ kit.args.codex_model }},pi=${{ kit.args.pi_provider }}/${{ kit.args.gemini_model }}");
+    const rest = structuredClone(spec);
+    delete rest.args;
+    delete rest.environment;
+    rest.setup.files = rest.setup.files.filter((file: any) => file.path !== models.path);
+    for (const pin of ["claude-opus-5-5", "gpt-6.1-sol", "gemini-3.8-flash"]) {
+      expect(JSON.stringify(rest)).not.toContain(pin);
+    }
+    expect(JSON.stringify(spec.setup.install)).toContain("command -v python3");
+  });
+
   test("keeps the published schema version", () => {
     expect(spec.schemaVersion).toBe("2");
     expect(spec.kind).toBe("sandbox");
@@ -208,7 +228,7 @@ describe("crew kit declaration", () => {
     expect(spec.version).not.toBe("0.4.5");
   });
 
-  test("the inner Herdr is pinned for a reproducible template build", () => {
+  test("the inner Herdr and agent CLIs have pinned template build defaults", () => {
     // The template bakes an ordinary upstream release; `latest` would make two
     // builds of the same source produce different images.
     const dockerfile = readFileSync(
@@ -218,6 +238,9 @@ describe("crew kit declaration", () => {
     const pin = dockerfile.match(/^ARG HERDR_VERSION=(.+)$/m);
     expect(pin).not.toBeNull();
     expect(pin![1].trim()).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(dockerfile).toContain("ARG CLAUDE_CODE_VERSION=2.1.289\n");
+    expect(dockerfile).toContain("ARG CODEX_VERSION=0.153.4\n");
+    expect(dockerfile).toContain("ARG PI_VERSION=0.85.1\n");
   });
 
   test("ships a brief for every native crew role", () => {
@@ -258,6 +281,7 @@ describe("crew kit declaration", () => {
   test("boots from a published image and never builds one at creation", () => {
     expect(spec.sandbox.image).toBe("${{ kit.args.image }}");
     expect(spec.args.image.default).toMatch(/^docker\.io\//);
+    expect(spec.args.image.default).toBe("docker.io/olegselajev241/herdr-crew:0.5.0");
     expect(spec.sandbox.build).toBeUndefined();
   });
 

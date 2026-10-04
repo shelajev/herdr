@@ -4,10 +4,34 @@
 multi-agent crews in Docker Sandboxes. Written 2026-09-07 as the system was
 built; kept as the narrative reference for explaining what we did and why.*
 
+## Candidate update, 2026-10-04
+
+The installed-state inventory and earlier validation below are dated records.
+The development sandbox inspected on 2026-10-04 has inner herdr 0.9.0 and the
+old kit protocol, without the candidate's models file, run acknowledgment or QC
+v2 gate. This work has not rebuilt a template, published a kit or installed a
+host driver. Source kit 0.5.0 is still treated as unpublished; the host must
+confirm its tag is unused or bump the kit version before publishing it.
+
+The candidate pins Claude Code to `claude-opus-5-5`, Codex to `gpt-6.1-sol`, and
+pi to provider `google` with `gemini-3.8-flash`. Select overrides at creation with
+`task new --claude-model`, `--codex-model`, `--pi-provider` and `--pi-model`, or
+the matching `HERDR_TASK_*` environment values listed in the
+[kit README](kits/herdr-crew/README.md#model-defaults-and-overrides). It explains
+operator setup, report-only goals and recovery without requiring the helper
+source. Fresh isolated probes verified these pins on the installed CLIs; earlier
+crew rounds used their old bootstrap defaults.
+
+The host must build the reviewed fork driver, select a template image with a
+recorded digest, publish the candidate kit under an unused version, and test the
+pair before moving defaults. Changing the inner herdr or agent CLI versions
+requires a template rebuild. The candidate behavior described below applies
+only after that promotion; it is not an inventory of an already-upgraded sandbox.
+
 ## The idea in one paragraph
 
 Work is organized around **tasks**. Each task gets its own directory (a
-worktree or clone), its own **Docker SBX microVM**, and a **crew of four
+dedicated standalone clone), its own **Docker SBX microVM**, and a **crew of four
 coding agents** inside it: an orchestrator that holds the goal, a planner, an
 implementer, and quality control. A full **herdr server runs inside the
 sandbox** and the agents are ordinary herdr-managed panes, so the same
@@ -46,7 +70,7 @@ herdr's same-user socket is not a capability boundary, SBX is.
 
 ## The independence rule
 
-**QC is never the model that implemented the work.** Each task's roles are
+**QC is assigned a different agent kind from the implementer.** Each task's roles are
 assigned by deterministic rotation over the three products (Claude Code,
 Codex, pi on Google models): the six permutations of planner/implementer/qc give each
 product exactly one crew role, and the orchestrator independently takes one
@@ -54,6 +78,11 @@ of the three (18 possible assignments, picked by a hash of the task slug).
 Explicit `--roles` overrides are rejected in code when implementer == qc.
 Rotation also spreads usage across the three subscriptions/keys — and makes
 every task's team composition a little different, which is half the fun.
+
+Reported implementer/qc kinds in evidence are checked against that assignment
+to catch wiring mistakes. They do not authenticate the writer: processes sharing
+the same user ID can write one another's crew files. Independent review is a
+workflow property, with the files and git history available for human inspection.
 
 ## Components
 
@@ -67,8 +96,8 @@ tested without any sandbox.
 `src/cli/task.rs` — the `herdr task` command family:
 
 ```
-herdr task new <slug> [--dir PATH] [--kit REF] [--roles ...]   provision
-herdr task goal <slug> "<text>" [--no-watch]                    deliver + watch
+herdr task new <slug> [--dir PATH] [--kit REF] [--roles ...] [MODEL FLAGS]   provision
+herdr task goal <slug> "<text>" [--no-watch] [--report-only]      deliver + watch
 herdr task watch <slug>                                         re-attach to progress
 herdr task status <slug>                                        crew agent states
 herdr task attach <slug>                                        live TUI (thin client)
@@ -76,10 +105,12 @@ herdr task policy <slug> [--allow DOMAIN]                       escalations
 herdr task ls / rm <slug>                                       lifecycle
 ```
 
+`MODEL FLAGS` are the four creation overrides listed in the candidate update above.
+
 There is deliberately **no server-side task state in v0**: sbx itself is the
 task registry (the sandbox name), and everything else lives in crew files
 inside the sandbox. Moving tasks into herdr's server state behind a `task.*`
-JSON API is planned follow-up, tracked in beans.
+JSON API is planned follow-up, tracked in beans (the CLI issue tracker).
 
 ### The kit (`kits/herdr-crew/`)
 
@@ -88,14 +119,13 @@ which image, what to verify at creation, credentials, network policy, and the
 agent instructions. Key choices:
 
 - **Tools live in a prebuilt template image**, not in kit install commands.
-  `docker.io/olegselajev241/herdr-crew` (linux/arm64) bakes in the latest
-  released herdr (0.9.0 in image 0.1.2),
-  Claude Code, Codex, pi (pi.dev — the Google-models member: provider google,
-  `GEMINI_API_KEY`, model pinned to `gemini-3.8-flash` by the kit's
-  `gemini_model` arg), and the beans issue tracker. Template
-  images are cached by the sandbox runtime, so creating a task takes seconds;
-  the kit's install step is just `crew-check`, which verifies the tools exist
-  and fails fast on a wrong image.
+  The dated image 0.1.2 record listed herdr 0.9.0 alongside Claude Code, Codex,
+  pi and beans. A future rebuild from the Dockerfile selects herdr 0.9.3;
+  source changes do not replace that installed runtime. Candidate kit args
+  `claude_model`, `codex_model`, `pi_provider` and `gemini_model` select the
+  three model pins above and populate `/home/agent/crew/models`. The host
+  override flags change those args at task creation. `crew-check` verifies
+  installed tools and Python; model probes verify actual responses at start.
 - **Proxy-managed credentials**: the kit declares which env var each service
   uses (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) and which
   domains get the header injected. Secrets are provided on the host with
@@ -120,45 +150,61 @@ Docker login. On top of that:
 
 ## Protocols (how the layers talk without trusting each other)
 
-Everything crosses the boundary as **files in `/home/agent/crew/`**, written
-by the crew, read by the host:
+The candidate protocol keeps these files in `/home/agent/crew/`, outside the
+reviewed repository:
 
-- `assignment`, `workdir` — written at provision time by the kit.
+- `assignment`, `workdir`, `models` — written at provision time by the kit.
+- `run.json` — host-written v2 run identity, goal digest, scope and base commit.
+- `qc.json` — QC-written v2 evidence for the exact clean reviewed HEAD.
+- `handoff.json` — run/round phase delivery and recovery ledger, guarded by a lock.
 - `goal.md` — the orchestrator records the goal verbatim.
 - `plan.md` — the planner's numbered plan; every step has an observable
-  done-condition.
-- `qc-log.md` — qc's findings; each review ends with a literal
+  done-condition, beginning with `PLAN run=<id> round=<N>`.
+- `qc-log.md` — qc's findings under `QC run=<id> round=<N> commit=<sha>`; each review ends with a literal
   `VERDICT: PASS` or `VERDICT: FAIL` line. Verdicts bind the orchestrator.
 - `status.md` — the orchestrator's progress notes, ending with exactly one
-  final `RESULT: DONE | FAILED | BLOCKED` line. `herdr task watch` tails this
-  file and exits 0/1/3 accordingly. The pack forbids `DONE` unless qc's
-  latest verdict is PASS.
+  final `RESULT: DONE | FAILED | BLOCKED` line. The orchestrator first writes
+  `ACK run=<id>` for a delivered goal; missing acknowledgment after native
+  delivery gives host exit 6. Watch exits 0 only for DONE with accepted v2
+  evidence, 4 for unaccepted DONE, 1 for FAILED and 3 for BLOCKED.
 - `escalations.md` — one line per resource request (blocked domain, needed
   credential). The watch surfaces new lines; the host decides:
   `herdr task policy <slug> --allow <domain>` scopes the grant to that one
   sandbox, then `herdr task goal <slug> "resources updated, continue"`
-  resumes the orchestrator.
+  resumes the orchestrator. No `--continue` flag exists or is needed. Every
+  allowed delivery mints a fresh run/base; change scope permits HEAD equal to
+  that base, while report-only requires it. Fresh QC is still required.
 
-These are prompt-enforced conventions, not cryptographic ones — a misbehaving
-orchestrator can misreport. The qc log, the git history in the workspace, and
-`task attach` are the audit trail.
+The orchestrator uses `crew_phase.py deliver` and `record` for serial phases.
+It checks the ledger after a restart, waits instead of duplicating active work,
+and requires exact clean HEAD when reusing a QC result. The host's gate checks
+scope, review window, passed checks and links from recovered attempts to passing
+checks. These file checks enforce consistency without authenticating their writer;
+the qc log, git history and `task attach` remain the human audit trail.
 
 ## A day in the life
+
+Run this on the host after candidate promotion, starting at the fork repository
+root. Use a standalone clone; linked worktrees with Git metadata outside the mount
+are refused. If 0.5.0 had to be bumped before publication, use the published version
+in the kit reference below.
 
 ```bash
 # one-time
 sbx setup ssh
 sbx secret set gemini -t "$GEMINI_API_KEY"        # + anthropic/openai
 cargo build --release                              # host herdr from this fork
-export HERDR_TASK_KIT=~/ai-contrib/herdr/kits/herdr-crew/   # or sbx kit push
+# After the host has published and tested this unused candidate version:
+export HERDR_TASK_KIT=docker.io/olegselajev241/herdr-crew-kit:0.5.0
+HERDR="$PWD/target/release/herdr"
 
 # per task — directly, or via the leader codex reading ~/ai-contrib/AGENTS.md
-git -C ~/src/proj worktree add ../proj-tasks/fix-login
-herdr task new fix-login --dir ~/src/proj-tasks/fix-login
-herdr task goal fix-login "Users get logged out on refresh; find and fix it, with a regression test."
+git clone ~/src/proj ~/src/proj-tasks/fix-login
+"$HERDR" task new fix-login --dir ~/src/proj-tasks/fix-login
+"$HERDR" task goal fix-login "Users get logged out on refresh; find and fix it, with a regression test."
 #   ...watch streams status lines, escalations, and the final RESULT...
-herdr task attach fix-login       # optional: watch the four agents live
-herdr task rm fix-login           # after reviewing/merging the branch
+"$HERDR" task attach fix-login       # optional: watch the four agents live
+"$HERDR" task rm fix-login           # after reviewing/merging the branch
 ```
 
 Goals don't have to be known in advance. `task new` provisions without one;
@@ -175,7 +221,10 @@ tools exist without any prompt changes. Mixins install as root, so the leader
 agent is only allowed to pass mixin references the human explicitly named
 (and sbx's kit-source allowlist gates which hosts kits may come from at all).
 
-## What was validated, and what wasn't
+## Historical validation, 2026-09-07
+
+The original crew work recorded these results. They are not validation results
+for the 2026-10-04 candidate:
 
 Built and tested inside a Docker sandbox on this repo:
 
@@ -192,10 +241,11 @@ Built and tested inside a Docker sandbox on this repo:
 - CLI validation paths exercised (slug rules, implementer≠qc rejection,
   friendly errors, rotation display).
 
-Not yet validated (needs a host with sbx): the end-to-end flow — sandbox
+Still requiring host validation for the candidate (needs sbx): the end-to-end flow — sandbox
 creation from the kit, ssh readiness, inner agent starts, a real
-goal-to-RESULT run. The inner herdr is the latest upstream release (0.9.0 in
-image 0.1.2), so the driver depends on its published CLI JSON shapes.
+goal-to-RESULT run. The observed inner herdr remains 0.9.0; the driver depends
+on its CLI JSON shapes. Isolated model and handoff probes do not validate the
+published driver/kit pair.
 
 ## Known limitations / next steps
 

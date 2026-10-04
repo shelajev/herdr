@@ -6,8 +6,12 @@ inside a Docker Sandbox. Everything in this file is a deviation from upstream
 that has to survive the next merge, together with the condition that would let
 us delete it.
 
-Tested at source commit `5da0a01e1eedda054db0c81dd3a780000c40d9f0` merged into
+The preceding upstream sync was tested at source commit `5da0a01e1eedda054db0c81dd3a780000c40d9f0` merged into
 the fork — that is upstream's master as of this sync, not a cherry-pick.
+
+The model pins, handoff ledger and QC v2 described below are candidate source
+changes documented on 2026-10-04. They have not been published or installed by
+this work. Historical observations and future promotion steps are separated here.
 
 ## Five operations people confuse
 
@@ -49,46 +53,37 @@ Verified on the host, 2026-10-03:
 | Observed inner server | v0.9.0 |
 | Upstream stable release | v0.9.3, published 2026-09-29 (a dated observation, not an installed version) |
 
-The template digest is genuinely unknown, not omitted. A mutable tag without a
+The template digest was not recorded in that inventory. A mutable tag without a
 recorded digest cannot prove which image a sandbox booted. Record one the next
 time the template is built.
 
-Nothing in that table has been upgraded by this work. The host driver is still
-the 0.8.2 build, the cached template image is unchanged, and the published kit
-is still 0.4.5. This sync produced commits; it did not install anything.
+This table is the 2026-10-03 host inventory; it is not a live registry query.
+The development sandbox inspected on 2026-10-04 still reports inner herdr 0.9.0
+and uses the old kit protocol without run.json/qc.json. Fresh probes confirmed
+the candidate model pins on its installed Claude Code 2.1.289, Codex 0.153.4 and
+pi 0.85.1 CLIs. Earlier crew work used the old bootstrap defaults. No host driver,
+kit or template was installed or published by these source changes.
 
-### The kit version gap
+### Candidate kit and driver pairing
 
-This source tree declares kit 0.5.0 because the completion protocol changed: QC
-now writes a machine-readable report, and `herdr task watch` will not accept a
-run without one. The published kit is still 0.4.5.
+The source kit remains 0.5.0, treated as unpublished. The 2026-10-03 inventory
+records published kit 0.4.5. The candidate adds a models file, pinned starts and
+response probes, run acknowledgments, native phase recovery and schema-v2 QC.
+An old kit lacks these files; the candidate host refuses it. An old host cannot
+supply the new run/ACK protocol and may still trust a prose DONE result.
 
-That gap is deliberate and must not be closed by overwriting the 0.4.5 tag.
-It also cannot be closed one half at a time: **neither mismatched pair is
-safe.**
+Promotion requires a tested driver/kit pair. The host must confirm 0.5.0 was
+never published before using that tag; otherwise bump the source kit version and
+README version string and publish under the new version. Do not overwrite 0.4.5
+or any already-published version tag. Publish a candidate tag for testing, then
+use `HERDR_TASK_KIT` to select that exact reference with the new driver. Only
+after end-to-end checks pass should the host drain old tasks, move `:latest` and
+install the new driver together. None of those publication steps happened here.
 
-| Host driver | Kit | Outcome |
-|---|---|---|
-| 0.8.2 (installed) | 0.4.5 (published) | Works. Today's arrangement. |
-| new (this source) | 0.4.5 | Every task refused: 0.4.5 never writes `qc.json`. |
-| 0.8.2 | 0.5.0 | Broken review step. The 0.5.0 QC brief tells the reviewer to copy a run id out of `run.json`, which only a new driver writes, so QC cannot produce a valid report — and the 0.8.2 driver accepts `RESULT: DONE` regardless. You get a pass with no gate behind it. |
-| new | 0.5.0 | The intended pair. |
-
-An earlier draft of this file claimed publishing the kit first was harmless.
-That was wrong, for the reason in row three.
-
-Promotion is therefore coordinated:
-
-1. Let the tasks already running drain. A sandbox keeps the kit it was created
-   from for its whole life, and a new driver refuses all 0.4.5 sandboxes.
-2. Publish kit 0.5.0 under its own version tag, leaving `:0.4.5` alone.
-3. Re-point `herdr-crew-kit:latest` to 0.5.0 and install the new host driver
-   together, before dispatching any new task.
-
-Tasks always run from a published kit; there is no local-path or ad-hoc
-`--kit` route. To test the new pair, publish 0.5.0 under its own version tag
-(nothing defaults to it yet) and point `HERDR_TASK_KIT` at that exact version
-before step 3 moves `:latest`. See `kits/herdr-crew/README.md`.
+The [kit README](../kits/herdr-crew/README.md) explains model overrides,
+`--report-only`, native recovery and ordinary `task goal` resume after a resource
+grant. There is no `--continue` flag. Each allowed goal delivery creates fresh
+run metadata; a valid change-scope QC report can accept HEAD equal to the new base.
 
 ### Next template build
 
@@ -97,15 +92,17 @@ instead of `latest`, so a template rebuild gets a known inner Herdr rather than
 whatever is newest that day. This is the *inner* Herdr — an ordinary upstream
 release, which does not need the fork's task commands.
 
-That pin fixes one input, not the image. The base image tag, the agent CLI
-versions installed from npm (`CLAUDE_CODE_VERSION`, `CODEX_VERSION`,
-`PI_VERSION` all still default to `latest`), and apt packages are all still
-mutable, so two builds of this Dockerfile on different days can differ. The
-template is not reproducible; it is merely no longer silently changing which
-Herdr it contains.
+The Dockerfile also pins the three npm CLI build defaults:
+`CLAUDE_CODE_VERSION=2.1.289`, `CODEX_VERSION=0.153.4` and `PI_VERSION=0.85.1`.
+These and `HERDR_VERSION=0.9.3` fix those version inputs. The base image tag and
+apt packages remain mutable, so builds on different days can still differ;
+these pins do not make the whole template reproducible.
 
-The pin takes effect on the next template build. The cached image still has
-whatever `latest` resolved to when it was last built.
+The pin takes effect only on a host-performed template rebuild and publication.
+Moving the observed sandbox runtime from 0.9.0 to 0.9.3 requires that rebuild and
+a kit pointing to the chosen image. Record its digest and CLI versions. A kit
+publication updates role packs and defaults for new sandboxes; it cannot replace
+binaries in an already-created sandbox.
 
 ## Promoting a new host task driver
 
@@ -218,30 +215,44 @@ longer a downgrade.
 
 ### 5. Exact-commit completion evidence
 
-**What.** `herdr task watch` exits 0 only when the crew's QC agent has written
-`/home/agent/crew/qc.json` naming the current run and the exact current commit.
-`RESULT: DONE` alone no longer finishes a task. `FAILED` and `BLOCKED` are
-unchanged — they are not claims of success.
+**What.** The candidate `herdr task watch` exits 0 only after `RESULT: DONE` and
+schema-v2 QC evidence agree on the current run and exact clean HEAD. Each goal
+delivery mints run.json with the current base commit and scope. The report echoes
+those fields, the goal digest and workspace, and names the review's start/finish
+commit and round. Reported role kinds must match their workflow assignments.
+This catches wiring mistakes; it does not authenticate the writer. All crew
+processes share a user ID, so independence comes from the assignment and review
+practice, not a cryptographic boundary between file writers.
 
-**Why.** `RESULT: DONE` is prose an agent wrote about itself. The gate requires
-the report to match the run the host minted, to name a full 40-character commit
-that is still HEAD with a clean tree, to come from the configured QC role rather
-than the implementer, and to list checks that actually ran and actually passed.
+**Why.** DONE is a claim the crew makes. Acceptance requires fresh evidence with
+full 40-character commits, an unchanged clean review window and nonempty checks
+that name their commands and all passed. No particular command is mandated:
+QC must select checks appropriate to the actual goal.
 
-The gate is deliberately generic. The driver runs whatever repository and goal
-you give it, including non-coding goals, so it does not require any particular
-build or test command. What it will not accept is a PASS with no checks, a PASS
-alongside a failed or skipped check, or a check entry that names nothing.
-
-A sandbox created before this protocol has no `qc.json`. Those runs are refused
-with a message saying so, rather than accepted or left hanging.
+Change scope permits the base commit or a descendant; report-only requires the
+base itself. An already-completed implementation does not need a redundant commit
+after a resource grant. Earlier blocked/failed attempts remain in `attempts` with
+a nonblank reason and `superseded_by` pointing to a passing current check. Watch
+prints those recovered attempts as history. A failed current check still refuses
+acceptance. v1 evidence is refused with a regenerate-with-a-current-kit message.
 
 **Remove when.** Never, unless completion stops meaning "reviewed".
 
-**Evidence.** The evidence tests in `src/tasks.rs` cover stale runs, wrong goals
-and workspaces, abbreviated and uppercase commit ids, dirty trees, unsupported
-schema versions, malformed reports, self-review, blank check entries, and a
-commit arriving after review.
+**Evidence.** Rust fixtures in `src/tasks.rs` cover stale run/goal/workspace,
+scope/base mismatch, review-window mismatch, HEAD moving after review, tracked
+and untracked dirt, full commit IDs, v1 refusal, malformed evidence, configured
+role mismatches, implementer==qc assignment rejection, empty/undescribed/failing
+checks, recovered attempt links and history formatting. They accept both equal-base
+and descendant change goals, reject unrelated history, and enforce report-only's
+unchanged base. Metadata round-trips preserve v2 fields.
+
+`crew_phase.py` complements the host gate with a run/round ledger. Python scenarios
+in `scripts/test_crew_phase.py` cover native missed acknowledgment, wait-only
+recovery, concurrent callers, stale rounds and exact-clean-HEAD reuse for QC.
+Plan/implementation phases retain ancestor-or-equal reuse. The host's pure tests
+also cover busy unfinished-goal refusal and exact current-run ACK matching. A
+live isolated Gemini handoff exercised settlement and duplicate suppression on
+inner herdr 0.9.0; this is not a published driver/kit end-to-end validation.
 
 ### 6. Zig dependency side-loading
 
@@ -251,10 +262,25 @@ commit arriving after review.
 `deps.files.ghostty.org` where curl gets the same bytes fine, which breaks
 `cargo build` at the vendored `zig build` step. Zig verifies packages by content
 hash, so the transport does not matter: the script downloads with curl and
-imports with `zig fetch`. This was reproduced again during this sync.
+imports with `zig fetch`. The transport discrepancy was reproduced in the
+2026-10-04 sandbox build. The helper now compares the computed hash with each
+build.zig.zon declaration, tracks required versus lazy packages, and exits nonzero
+when a required download, import or hash check fails. Optional failures are listed
+explicitly; a successful prefetch does not prove every lazy package is available.
+The actual `zig build` decides which lazy packages the requested target needs.
 
-**Remove when.** `cargo build --locked` succeeds on a clean Zig cache without
-running it.
+The same build needed packages from deps.files.ghostty.org and codeberg.org;
+its lib-VT target did not need the optional fontconfig package from
+gitlab.freedesktop.org. These are observed target requirements, not a grant for
+all packages or domains. Behavioral shims in `scripts/test_fetch_zig_deps.py`
+cover required/optional failures, hash mismatches, transitive discovery and the
+GitHub .git-suffix rewrite.
+
+**Remove when.** The target build's direct Zig downloads succeed and
+`cargo build --locked` passes with fresh Zig global/local caches and no prefetch
+or previously extracted package cache. Record the target, toolchain and network
+conditions. A build that reused curl-imported packages does not meet this test;
+the 2026-10-04 successful build used the helper, so it does not justify removal.
 
 **Note.** The other half of the original build fix — installing the vendored
 library into a per-target output directory so two targets sharing a checkout do
@@ -319,8 +345,8 @@ checkout, and that publishing is gated on validation having succeeded.
 
 ## Keeping this honest
 
-`just fork-compat-test` runs `scripts/test_fork_sync.py` and
-`scripts/fork-workflows.test.ts`, and `just ci` runs it, so a merge that removes
+`just fork-compat-test` runs the model/phase helper scenarios,
+`scripts/test_fork_sync.py` and `scripts/fork-workflows.test.ts`, and `just ci` runs it, so a merge that removes
 one of these fails before it lands. The behavioral contracts — role ids, sandbox
 argv, completion evidence, update policy — are Rust tests in the normal suite. Linux CI runs the
 full test suite including the `live_handoff` integration test; macOS excludes

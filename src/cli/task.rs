@@ -28,6 +28,9 @@ const DEFAULT_WORKSPACE_DIR: &str = "/home/agent/workspace";
 /// that an independent reviewer accepted its current commit. Distinct from
 /// BLOCKED (3) so automation can tell "needs resources" from "not reviewed".
 const EXIT_UNACCEPTED: i32 = 4;
+/// Native delivery succeeded but the orchestrator did not acknowledge this run.
+const EXIT_UNACKNOWLEDGED: i32 = 6;
+const GOAL_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn run_task_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -65,9 +68,9 @@ pub(super) fn run_task_command(args: &[String]) -> std::io::Result<i32> {
 fn print_task_help() {
     eprintln!("usage:");
     eprintln!(
-        "  herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--roles orchestrator=K,planner=K,implementer=K,qc=K]"
+        "  herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles orchestrator=K,planner=K,implementer=K,qc=K]"
     );
-    eprintln!("  herdr task goal <slug> <text> [--no-watch]");
+    eprintln!("  herdr task goal <slug> <text> [--no-watch] [--report-only]");
     eprintln!("  herdr task watch <slug>");
     eprintln!("  herdr task ls");
     eprintln!("  herdr task status <slug>");
@@ -76,6 +79,10 @@ fn print_task_help() {
     eprintln!("  herdr task rm <slug>");
     eprintln!();
     eprintln!("Tasks run in Docker SBX sandboxes provisioned from the herdr-crew kit.");
+    eprintln!("Model override precedence: flags, then HERDR_TASK_CLAUDE_MODEL,");
+    eprintln!(
+        "HERDR_TASK_CODEX_MODEL, HERDR_TASK_PI_PROVIDER, HERDR_TASK_PI_MODEL, then kit defaults."
+    );
     eprintln!("Requires the sbx CLI and one-time `sbx setup ssh`. The kit reference");
     eprintln!(
         "defaults to {} (override with --kit or {}).",
@@ -126,6 +133,28 @@ fn ssh_capture(host: &str, remote_command: &str) -> std::io::Result<RemoteOutput
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// ACK polling must bound the SSH read too, not just the delay between polls.
+fn read_goal_ack(host: &str, timeout: Duration) -> std::io::Result<String> {
+    let child = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            host,
+            "cat /home/agent/crew/status.md",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let output = crate::remote::wait_with_output_timeout(child, timeout)?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            "could not read the goal acknowledgment",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn ssh_herdr_json(
@@ -259,11 +288,44 @@ fn accept_completed_run(
 
     let run_before = bail!(read_evidence_file(host, tasks::RUN_METADATA_FILE)?);
     let head_before = bail!(remote_git(host, workdir, &["rev-parse", "HEAD"])?);
+    let porcelain_before = bail!(remote_git(host, workdir, &["status", "--porcelain"])?);
     let qc = bail!(read_evidence_file(host, tasks::QC_EVIDENCE_FILE)?);
+    let Some(run_raw) = run_before.as_deref() else {
+        return Ok(Err(
+            tasks::EvidenceError::Missing(tasks::RUN_METADATA_FILE).to_string()
+        ));
+    };
+    let run = match tasks::RunMetadata::parse(run_raw) {
+        Ok(run) => run,
+        Err(err) => return Ok(Err(err.to_string())),
+    };
+    if !tasks::is_full_commit_id(&run.base_commit) || !tasks::is_full_commit_id(head_before.trim())
+    {
+        return Ok(Err("base_commit and HEAD must be full commit ids".into()));
+    }
+    // Keep ancestry inside the same read window as the report and HEAD.
+    // Non-ancestry and an unreadable Git graph both refuse acceptance.
+    if run.scope == tasks::RunScope::Change {
+        bail!(remote_git(
+            host,
+            workdir,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &run.base_commit,
+                head_before.trim()
+            ]
+        )?);
+    }
     let porcelain = bail!(remote_git(host, workdir, &["status", "--porcelain"])?);
     let head_after = bail!(remote_git(host, workdir, &["rev-parse", "HEAD"])?);
     let run_after = bail!(read_evidence_file(host, tasks::RUN_METADATA_FILE)?);
 
+    if porcelain_before != porcelain {
+        return Ok(Err(
+            "the workspace changed while QC evidence was being read".into(),
+        ));
+    }
     if head_before.trim() != head_after.trim() {
         return Ok(Err(format!(
             "the workspace moved from {} to {} while its QC evidence was being read; \
@@ -284,6 +346,7 @@ fn accept_completed_run(
         qc.as_deref(),
         head_before.trim(),
         &porcelain,
+        true,
     ) {
         Ok(evidence) => Ok(Ok(evidence)),
         Err(err) => Ok(Err(err.to_string())),
@@ -297,7 +360,7 @@ fn accept_completed_run(
 fn task_new(args: &[String]) -> std::io::Result<i32> {
     let Some(slug) = args.first().cloned() else {
         eprintln!(
-            "usage: herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--roles ...]"
+            "usage: herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles ...]"
         );
         return Ok(2);
     };
@@ -309,12 +372,14 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
     let mut dir = None;
     let mut kit = None;
     let mut roles_arg = None;
+    let mut models = tasks::ModelOverrides::default();
     let mut mixins: Vec<String> = Vec::new();
     let mut index = 1;
     while index < args.len() {
         let (option, value) = (args[index].as_str(), args.get(index + 1));
         match option {
-            "--dir" | "--kit" | "--roles" | "--mixin" => {
+            "--dir" | "--kit" | "--roles" | "--mixin" | "--claude-model" | "--codex-model"
+            | "--pi-provider" | "--pi-model" => {
                 let Some(value) = value else {
                     eprintln!("missing value for {option}");
                     return Ok(2);
@@ -323,6 +388,10 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
                     "--dir" => dir = Some(value.clone()),
                     "--kit" => kit = Some(value.clone()),
                     "--mixin" => mixins.push(value.clone()),
+                    "--claude-model" => models.claude = Some(value.clone()),
+                    "--codex-model" => models.codex = Some(value.clone()),
+                    "--pi-provider" => models.pi_provider = Some(value.clone()),
+                    "--pi-model" => models.pi_model = Some(value.clone()),
                     _ => roles_arg = Some(value.clone()),
                 }
                 index += 2;
@@ -334,6 +403,19 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
+    models = models.with_fallback(tasks::ModelOverrides {
+        claude: std::env::var("HERDR_TASK_CLAUDE_MODEL").ok(),
+        codex: std::env::var("HERDR_TASK_CODEX_MODEL").ok(),
+        pi_provider: std::env::var("HERDR_TASK_PI_PROVIDER").ok(),
+        pi_model: std::env::var("HERDR_TASK_PI_MODEL").ok(),
+    });
+    let model_args = match models.kit_args() {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("invalid model override: {err}");
+            return Ok(2);
+        }
+    };
     let roles = match roles_arg {
         Some(value) => match parse_roles(&value) {
             Ok(roles) => roles,
@@ -384,7 +466,7 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
         println!("  mixin:     {mixin}");
     }
 
-    let argv = sbx_create_argv(&kit, &workspace, &slug, &roles, &mixins);
+    let argv = sbx_create_argv(&kit, &workspace, &slug, &roles, &mixins, &model_args);
     let exit_code = run_inherited(&argv)?;
     if exit_code != 0 {
         eprintln!("sbx create failed (exit {exit_code})");
@@ -397,6 +479,14 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
         // Require a real server request: status text can describe stale state.
         let probe = server_running_probe(&host)?;
         if probe.exit_code == 0 {
+            let pins = match crew_models(&host) {
+                Ok(pins) => pins,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(1);
+                }
+            };
+            println!("  models:    {}", pins.file_value());
             println!("task {slug} is ready.");
             println!("  herdr task goal {slug} \"<what to build>\"");
             println!("  herdr task attach {slug}");
@@ -453,10 +543,12 @@ fn ensure_server(host: &str) -> std::io::Result<bool> {
 fn task_goal(args: &[String]) -> std::io::Result<i32> {
     // --no-watch may appear anywhere, including before the positionals.
     let mut watch = true;
+    let mut scope = tasks::RunScope::Change;
     let mut positionals = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--no-watch" => watch = false,
+            "--report-only" => scope = tasks::RunScope::ReportOnly,
             other if other.starts_with("--") => {
                 eprintln!("unknown option: {other}");
                 return Ok(2);
@@ -466,7 +558,7 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
     }
     let (Some(slug), Some(goal)) = (positionals.first().cloned(), positionals.get(1).cloned())
     else {
-        eprintln!("usage: herdr task goal <slug> <text> [--no-watch]");
+        eprintln!("usage: herdr task goal <slug> <text> [--no-watch] [--report-only]");
         return Ok(2);
     };
     if let Err(err) = validate_slug(&slug) {
@@ -506,12 +598,59 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
         return Ok(1);
     }
 
-    // Mint this run's identity before the goal is delivered. The QC report must
+    // Check before minting metadata: an old active turn must not be mistaken
+    // for acknowledgment of a new parallel goal. This does not preserve runs.
+    let orchestrator = match ssh_herdr_json(&host, &["agent", "get", "orchestrator"])? {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("cannot inspect the orchestrator: {err}");
+            return Ok(1);
+        }
+    };
+    let Some(orchestrator_status) = orchestrator
+        .pointer("/result/agent/agent_status")
+        .and_then(|v| v.as_str())
+    else {
+        eprintln!("cannot read the orchestrator's native status");
+        return Ok(1);
+    };
+    let status = match read_evidence_file(&host, "status.md")? {
+        Ok(value) => value.unwrap_or_default(),
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(1);
+        }
+    };
+    if tasks::goal_delivery_decision(orchestrator_status, tasks::current_run_slice(&status))
+        == tasks::GoalDeliveryDecision::Busy
+    {
+        let current_run = match read_evidence_file(&host, tasks::RUN_METADATA_FILE)? {
+            Ok(Some(raw)) => tasks::RunMetadata::parse(&raw).ok().map(|run| run.run_id),
+            _ => None,
+        }
+        .unwrap_or_else(|| "unknown".into());
+        eprintln!("run {current_run} is still in progress; use `herdr task watch {slug}`");
+        return Ok(1);
+    }
+
+    // Mint this run's identity before every goal delivery. The QC report must
     // name this run id and this run's goal, so a report left behind by an
     // earlier run can never be mistaken for acceptance of this one. Discarding
     // any previous report is part of the same step: evidence describes one
     // reviewed commit of one run, and it is invalid the moment a new run opens.
-    let run = tasks::new_run_metadata(&goal, &workdir);
+    let base_commit = match remote_git(&host, &workdir, &["rev-parse", "HEAD"])? {
+        Ok(head) if tasks::is_full_commit_id(head.trim()) => head.trim().to_string(),
+        _ => {
+            eprintln!("cannot start a task goal: the workspace must have a readable commit (HEAD)");
+            return Ok(1);
+        }
+    };
+    match remote_git(&host, &workdir, &["status", "--porcelain"])? {
+        Ok(porcelain) if !porcelain.trim().is_empty() => eprintln!("warning: starting from a dirty workspace (including untracked files); QC requires a clean tree"),
+        Ok(_) => {},
+        Err(err) => { eprintln!("cannot read the starting worktree: {err}"); return Ok(1); }
+    }
+    let run = tasks::new_run_metadata(&goal, &workdir, &base_commit, scope);
     remove_crew_file(&host, tasks::QC_EVIDENCE_FILE)?;
     if let Err(err) = write_crew_file(&host, tasks::RUN_METADATA_FILE, &run.to_json())? {
         eprintln!("failed to record this run's identity: {err}");
@@ -528,12 +667,13 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
     let _ = ssh_capture(&host, &marker)?;
 
     let goal_prompt = format!(
-        "You are the crew orchestrator for this task. Read {CREW_DIR}/roles/orchestrator.md \
+        "HANDOFF run={} phase=goal role=orchestrator\nYou are the crew orchestrator for this task. Read {CREW_DIR}/roles/orchestrator.md \
          and follow it exactly: assemble the crew from {CREW_DIR}/assignment, coordinate \
          plan -> implement -> qc rounds until qc passes, record progress in \
          {CREW_DIR}/status.md, and finish by appending a final line \
          'RESULT: DONE', 'RESULT: FAILED', or 'RESULT: BLOCKED' to {CREW_DIR}/status.md. \
-         The workspace is {workdir}. /goal: {goal}"
+         The workspace is {workdir}. /goal: {goal}",
+        run.run_id
     );
     // Starting a TUI can briefly look idle before its final initialization
     // redraw. Confirm the prompt actually triggered work rather than treating
@@ -557,7 +697,24 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
         eprintln!("failed to deliver the goal: {err}");
         return Ok(1);
     }
-    println!("goal delivered to the sandboxed orchestrator.");
+    let ack_deadline = std::time::Instant::now() + GOAL_ACK_TIMEOUT;
+    loop {
+        let remaining = ack_deadline.saturating_duration_since(std::time::Instant::now());
+        match read_goal_ack(&host, remaining) {
+            Ok(status) if tasks::run_acknowledged(&status, &run.run_id) => break,
+            Err(_) => {
+                eprintln!("native goal delivery succeeded, but status.md could not be read to verify ACK run={}; inspect with `herdr task attach {slug}`", run.run_id);
+                return Ok(EXIT_UNACKNOWLEDGED);
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= ack_deadline {
+            eprintln!("native goal delivery succeeded, but ACK run={} was not observed in status.md within 120 seconds; inspect with `herdr task attach {slug}`", run.run_id);
+            return Ok(EXIT_UNACKNOWLEDGED);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    println!("goal delivered and acknowledged by the sandboxed orchestrator.");
     if !watch {
         println!("follow progress with: herdr task watch {slug}");
         return Ok(0);
@@ -680,9 +837,7 @@ fn watch_task(
                             "task {slug}: RESULT: DONE — accepted at {} (qc {}, implementer {})",
                             evidence.commit, evidence.qc, evidence.implementer
                         );
-                        for check in &evidence.checks {
-                            println!("  check | {} | {}", check.name, check.command);
-                        }
+                        println!("{}", tasks::format_qc_evidence(&evidence));
                         println!("review with: herdr task attach {slug}");
                         return Ok(0);
                     }
@@ -727,6 +882,28 @@ fn crew_assignment(host: &str) -> std::io::Result<Option<RoleAssignment>> {
     }
 }
 
+fn crew_models(host: &str) -> Result<tasks::ModelPins, String> {
+    let content = read_evidence_file(host, "models")
+        .map_err(|err| err.to_string())??
+        .ok_or("sandbox predates model pins (models file missing); recreate the task")?;
+    tasks::parse_models(&content).map_err(|err| format!("invalid sandbox model pins: {err}"))
+}
+
+fn probe_model(host: &str, role: &str) -> Result<(), String> {
+    let helper = format!("{CREW_DIR}/bin/crew_models.py");
+    let output = ssh_capture(
+        host,
+        &tasks::remote_command(&["python3", &helper, "probe", "--role", role]),
+    )
+    .map_err(|err| err.to_string())?;
+    if output.exit_code != 0 {
+        return Err(format!("model verification failed (exit {}): {} {}; close the {role} pane and rerun, or recreate the task",
+            output.exit_code, output.stdout.trim(), output.stderr.trim()));
+    }
+    println!("{}", output.stdout.trim());
+    Ok(())
+}
+
 /// Make sure a named crew agent is running inside the sandbox, creating a tab
 /// and starting the assigned agent kind when missing.
 fn ensure_agent(
@@ -735,17 +912,47 @@ fn ensure_agent(
     roles: &RoleAssignment,
     workdir: &str,
 ) -> Result<(), String> {
-    let exists = ssh_herdr_json(host, &["agent", "get", role])
-        .map_err(|err| err.to_string())?
-        .is_ok();
-    if exists {
-        dismiss_codex_update(host, role)?;
-        return Ok(());
+    let pins = crew_models(host)?;
+    let helper = format!("{CREW_DIR}/bin/crew_models.py");
+    let helper_check = ssh_capture(host, &format!("test -r {}", shell_quote(&helper)))
+        .map_err(|err| err.to_string())?;
+    if helper_check.exit_code != 0 {
+        return Err(
+            "sandbox predates model pins (crew_models.py missing); recreate the task".into(),
+        );
     }
-
     let Some(kind) = roles.kind_for(role) else {
         return Err(format!("no kind assigned for role {role}"));
     };
+    let passthrough = tasks::agent_start_args(kind, &pins);
+    if passthrough.is_empty() {
+        return Err(format!("unsupported crew agent kind: {kind}"));
+    }
+    if ssh_herdr_json(host, &["agent", "get", role])
+        .map_err(|err| err.to_string())?
+        .is_ok()
+    {
+        dismiss_codex_update(host, role)?;
+        let info =
+            ssh_herdr_json(host, &["agent", "get", role]).map_err(|err| err.to_string())??;
+        if info.pointer("/result/agent/agent").and_then(|v| v.as_str()) != Some(kind) {
+            return Err(format!("{role} kind differs from assignment; close the {role} pane and rerun, or recreate the task"));
+        }
+        return match info
+            .pointer("/result/agent/agent_status")
+            .and_then(|v| v.as_str())
+        {
+            Some("working") => {
+                eprintln!("warning: {role} model not verified (busy)");
+                Ok(())
+            }
+            Some("idle" | "done") => probe_model(host, role),
+            _ => Err(format!(
+                "{role} is not ready for model verification; inspect its pane"
+            )),
+        };
+    }
+
     println!("starting {role} ({kind})...");
     let workspaces =
         ssh_herdr_json(host, &["workspace", "list"]).map_err(|err| err.to_string())??;
@@ -793,7 +1000,8 @@ fn ensure_agent(
     };
 
     let timeout = AGENT_START_TIMEOUT_MS.to_string();
-    let mut start_args = vec![
+    let mut argv = vec![
+        "herdr",
         "agent",
         "start",
         role,
@@ -803,27 +1011,10 @@ fn ensure_agent(
         &pane_id,
         "--timeout",
         &timeout,
+        "--",
     ];
-    // pi is the Google-models member and pins the crew model configured by the
-    // kit. The variable expands in the sandbox shell, so it stays outside the
-    // quoted argv.
-    let start_remote = if kind == "pi" {
-        let mut argv = vec!["herdr"];
-        argv.extend_from_slice(&start_args);
-        format!(
-            "{} -- --provider google --model \"${{HERDR_CREW_GEMINI_MODEL:-gemini-3.8-flash}}\"",
-            tasks::remote_command(&argv)
-        )
-    } else {
-        let mut argv = vec!["herdr"];
-        argv.append(&mut start_args);
-        if kind == "codex" {
-            // Crew CLI updates belong to template maintenance, not an unattended
-            // startup menu. This also protects existing sandbox configurations.
-            argv.extend(["--", "-c", "check_for_update_on_startup=false"]);
-        }
-        tasks::remote_command(&argv)
-    };
+    argv.extend(passthrough.iter().map(String::as_str));
+    let start_remote = tasks::remote_command(&argv);
     let output = ssh_capture(host, &start_remote).map_err(|err| err.to_string())?;
     if output.exit_code != 0 {
         return Err(format!(
@@ -836,7 +1027,7 @@ fn ensure_agent(
             }
         ));
     }
-    Ok(())
+    probe_model(host, role)
 }
 
 /// Recover only the known updater menu in older crew images. Never press

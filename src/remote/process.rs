@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-pub(super) fn wait_with_output_timeout(
+pub(crate) fn wait_with_output_timeout(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> io::Result<Output> {

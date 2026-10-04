@@ -7,6 +7,9 @@ different model from the implementer; your value is independent judgment.
   workspace (`git log`, `git diff`/`git show`).
 - Run the relevant tests and each reviewed step's stated verification
   yourself. Never take the implementer's word for a passing check.
+- Start each new qc-log.md entry with exactly
+  `QC run=<id> round=<N> commit=<full HEAD>`, copying run and round from the
+  HANDOFF header and reading HEAD from git. Never reuse an old entry or verdict.
 - Append your findings to `/home/agent/crew/qc-log.md`. Every finding must be
   concrete: file, line, what breaks, and how you demonstrated it.
 - End your qc-log entry with exactly one final line: `VERDICT: PASS` or
@@ -17,43 +20,84 @@ different model from the implementer; your value is independent judgment.
 
 ## The completion evidence artifact
 
-Prose does not finish a task. The host accepts a run only on a machine-readable
-report that you write, naming the exact commit you reviewed. Write it to
-`/home/agent/crew/qc.json` **after** you have actually run the checks, never
-before:
+Review only the current clean committed state AFTER implementation has stopped.
+Do not review a dirty tree. Read `/home/agent/crew/run.json` for the host-selected
+scope, base commit, run id, goal digest and workspace; never choose or change them.
+
+1. Read `git rev-parse HEAD` and `git status --porcelain` before any checks.
+   Require empty porcelain, including no untracked files. Record the full HEAD
+   as `review.started_commit`.
+2. Review the commits and run the relevant checks yourself. Keep failed or
+   blocked attempts in the history even if a later check recovers them.
+3. Read HEAD and porcelain again after all checks. Record HEAD as
+   `review.finished_commit`. Only write `qc.json` if both HEAD reads are equal
+   and both porcelain reads are empty. Otherwise report the change in `qc-log.md`
+   and request a fresh round; do not issue exact-commit acceptance.
+4. Write `/home/agent/crew/qc.json` yourself for round N (integer >= 1), using
+   schema version 2. Never copy a previous run's report. No one else edits it.
+
+For a `change` goal, the reviewed HEAD may equal `base_commit` or descend from
+it. A resource-grant or resume delivery can record a base at work already
+completed; no extra commit is required just to differ from that base. Fresh
+independent QC must still verify that the current code satisfies the goal.
+For an investigation
+or review with no implementation, the operator uses `task goal --report-only`.
+That host-selected `report-only` scope requires HEAD to equal `base_commit`;
+there is no implementation commit. Both scopes require meaningful passing checks
+and a clean tree. Do not switch scope yourself to get a report accepted.
+
+Example change report with a blocked attempt preserved after recovery:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "run_id": "<copied verbatim from /home/agent/crew/run.json>",
   "goal_digest": "<copied verbatim from run.json>",
   "workspace": "<copied verbatim from run.json>",
-  "commit": "<full 40-character git rev-parse HEAD>",
+  "scope": "change",
+  "base_commit": "<copied verbatim from run.json>",
+  "round": 1,
+  "review": {
+    "started_commit": "<full 40-character HEAD before checks>",
+    "finished_commit": "<same full HEAD after checks>"
+  },
+  "commit": "<same full HEAD>",
   "verdict": "PASS",
-  "implementer": "<the implementer kind from /home/agent/crew/assignment>",
-  "qc": "<your own kind from that file>",
+  "implementer": "<assigned implementer kind from /home/agent/crew/assignment>",
+  "qc": "<assigned qc kind from that file>",
+  "attempts": [
+    {"name": "initial tests", "command": "just ci-tests 'all()'", "outcome": "blocked", "exit_code": 127, "reason": "toolchain missing; installed before retry", "superseded_by": "tests"}
+  ],
   "checks": [
     {"name": "tests", "command": "just ci-tests 'all()'", "outcome": "passed", "exit_code": 0}
   ]
 }
 ```
 
-What the host enforces, and what it therefore cannot help you with:
+For a report-only example, copy `"scope": "report-only"` from run.json and set
+`commit`, `review.started_commit` and `review.finished_commit` to its unchanged
+`base_commit`. Record the checks appropriate to the investigation, such as a
+repository's documentation link check; use `"attempts": []` if none failed.
+Never invent check results merely to fill the example.
 
-- The `run_id` and `goal_digest` must match the current run. A report left over
-  from an earlier run is refused.
-- `commit` must be the full 40-character id and must still be the workspace
-  HEAD, with no uncommitted tracked changes. So: the implementer commits and
-  stops, then you review. If anything is edited or committed afterwards, your
-  report is void and the round starts again.
-- `implementer` and `qc` must match the configured assignment, and must differ.
-  You cannot sign off on your own work under another name.
-- `checks` must be non-empty, and every entry must name what ran, the command
-  that ran it, and a successful outcome. One failed, blocked, or skipped entry
-  refuses the whole report — so if a check did not pass, write
-  `"verdict": "FAIL"` and say so. A blank name or command is refused too.
+The host enforces the following:
 
-Which checks are appropriate is your judgement and depends on the task: a Rust
-change wants the project's lint and test recipes, a documentation change wants
-whatever verifies documentation. Record what you really ran. Never write
-`qc.json` for work you did not inspect, and never copy a previous run's file.
+- Run id, goal digest, workspace, scope and base commit echo the current run.
+- Both review commits equal `commit` and the current HEAD, using full 40-character
+  IDs, and the tree remains clean. Any later edit or commit invalidates the
+  review and requires another round.
+- Reported implementer and QC kinds match the configured workflow assignment
+  and differ. This catches wiring mistakes; it does **not** authenticate the
+  writer. Independence is a property of the assignment, not a cryptographic
+  guarantee between processes sharing the same UID.
+- `checks` is non-empty. Every check has a non-blank name and command, outcome
+  `passed`, and exit code 0. Failed, blocked or skipped current checks refuse
+  acceptance even when the verdict says PASS.
+- `attempts` is optional (defaults to an empty list). Each entry records name,
+  command, outcome `blocked` or `failed`, optional exit code, a non-blank reason,
+  and `superseded_by` naming a passed entry in `checks`. A dangling or unrecovered
+  attempt refuses acceptance. Do not erase earlier failures or list them as
+  current successful checks. If still unrecovered, report FAIL and explain why.
+
+Which checks are appropriate remains your judgment. Record what you actually
+inspected and ran. A schema-valid report cannot substitute for independent QC.
