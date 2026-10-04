@@ -338,6 +338,10 @@ fn task_command() -> Command {
                         .action(ArgAction::Append)
                         .help("Extra sbx mixin kit to stack onto the sandbox (repeatable)"),
                 )
+                .arg(option("claude-model", "ID").help("Claude model (env: HERDR_TASK_CLAUDE_MODEL)"))
+                .arg(option("codex-model", "ID").help("Codex model (env: HERDR_TASK_CODEX_MODEL)"))
+                .arg(option("pi-provider", "ID").help("pi provider (env: HERDR_TASK_PI_PROVIDER)"))
+                .arg(option("pi-model", "ID").help("pi model (env: HERDR_TASK_PI_MODEL)"))
                 .arg(option("roles", "SPEC").help(
                     "orchestrator=KIND,planner=KIND,implementer=KIND,qc=KIND (qc must differ from implementer)",
                 )),
@@ -1076,6 +1080,37 @@ fn path_arg(name: &'static str, value_name: &'static str) -> Arg {
 #[cfg(test)]
 mod tests {
     use clap::{Arg, Command};
+
+    #[test]
+    fn task_new_accepts_explicit_model_overrides() {
+        let matches = super::task_command()
+            .try_get_matches_from([
+                "task",
+                "new",
+                "demo",
+                "--claude-model",
+                "claude-test",
+                "--codex-model",
+                "codex-test",
+                "--pi-provider",
+                "provider-test",
+                "--pi-model",
+                "pi-test",
+            ])
+            .expect("valid task model flags");
+        let new = matches.subcommand_matches("new").expect("new command");
+        for (flag, expected) in [
+            ("claude-model", "claude-test"),
+            ("codex-model", "codex-test"),
+            ("pi-provider", "provider-test"),
+            ("pi-model", "pi-test"),
+        ] {
+            assert_eq!(
+                new.get_one::<String>(flag).map(String::as_str),
+                Some(expected)
+            );
+        }
+    }
 
     fn command_path<'a>(cmd: &'a Command, path: &[&str]) -> &'a Command {
         let mut current = cmd;

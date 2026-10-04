@@ -65,7 +65,7 @@ pub(super) fn run_task_command(args: &[String]) -> std::io::Result<i32> {
 fn print_task_help() {
     eprintln!("usage:");
     eprintln!(
-        "  herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--roles orchestrator=K,planner=K,implementer=K,qc=K]"
+        "  herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles orchestrator=K,planner=K,implementer=K,qc=K]"
     );
     eprintln!("  herdr task goal <slug> <text> [--no-watch]");
     eprintln!("  herdr task watch <slug>");
@@ -76,6 +76,10 @@ fn print_task_help() {
     eprintln!("  herdr task rm <slug>");
     eprintln!();
     eprintln!("Tasks run in Docker SBX sandboxes provisioned from the herdr-crew kit.");
+    eprintln!("Model override precedence: flags, then HERDR_TASK_CLAUDE_MODEL,");
+    eprintln!(
+        "HERDR_TASK_CODEX_MODEL, HERDR_TASK_PI_PROVIDER, HERDR_TASK_PI_MODEL, then kit defaults."
+    );
     eprintln!("Requires the sbx CLI and one-time `sbx setup ssh`. The kit reference");
     eprintln!(
         "defaults to {} (override with --kit or {}).",
@@ -297,7 +301,7 @@ fn accept_completed_run(
 fn task_new(args: &[String]) -> std::io::Result<i32> {
     let Some(slug) = args.first().cloned() else {
         eprintln!(
-            "usage: herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--roles ...]"
+            "usage: herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles ...]"
         );
         return Ok(2);
     };
@@ -309,12 +313,14 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
     let mut dir = None;
     let mut kit = None;
     let mut roles_arg = None;
+    let mut models = tasks::ModelOverrides::default();
     let mut mixins: Vec<String> = Vec::new();
     let mut index = 1;
     while index < args.len() {
         let (option, value) = (args[index].as_str(), args.get(index + 1));
         match option {
-            "--dir" | "--kit" | "--roles" | "--mixin" => {
+            "--dir" | "--kit" | "--roles" | "--mixin" | "--claude-model" | "--codex-model"
+            | "--pi-provider" | "--pi-model" => {
                 let Some(value) = value else {
                     eprintln!("missing value for {option}");
                     return Ok(2);
@@ -323,6 +329,10 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
                     "--dir" => dir = Some(value.clone()),
                     "--kit" => kit = Some(value.clone()),
                     "--mixin" => mixins.push(value.clone()),
+                    "--claude-model" => models.claude = Some(value.clone()),
+                    "--codex-model" => models.codex = Some(value.clone()),
+                    "--pi-provider" => models.pi_provider = Some(value.clone()),
+                    "--pi-model" => models.pi_model = Some(value.clone()),
                     _ => roles_arg = Some(value.clone()),
                 }
                 index += 2;
@@ -334,6 +344,19 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
+    models = models.with_fallback(tasks::ModelOverrides {
+        claude: std::env::var("HERDR_TASK_CLAUDE_MODEL").ok(),
+        codex: std::env::var("HERDR_TASK_CODEX_MODEL").ok(),
+        pi_provider: std::env::var("HERDR_TASK_PI_PROVIDER").ok(),
+        pi_model: std::env::var("HERDR_TASK_PI_MODEL").ok(),
+    });
+    let model_args = match models.kit_args() {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("invalid model override: {err}");
+            return Ok(2);
+        }
+    };
     let roles = match roles_arg {
         Some(value) => match parse_roles(&value) {
             Ok(roles) => roles,
@@ -384,7 +407,7 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
         println!("  mixin:     {mixin}");
     }
 
-    let argv = sbx_create_argv(&kit, &workspace, &slug, &roles, &mixins);
+    let argv = sbx_create_argv(&kit, &workspace, &slug, &roles, &mixins, &model_args);
     let exit_code = run_inherited(&argv)?;
     if exit_code != 0 {
         eprintln!("sbx create failed (exit {exit_code})");
@@ -397,6 +420,14 @@ fn task_new(args: &[String]) -> std::io::Result<i32> {
         // Require a real server request: status text can describe stale state.
         let probe = server_running_probe(&host)?;
         if probe.exit_code == 0 {
+            let pins = match crew_models(&host) {
+                Ok(pins) => pins,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(1);
+                }
+            };
+            println!("  models:    {}", pins.file_value());
             println!("task {slug} is ready.");
             println!("  herdr task goal {slug} \"<what to build>\"");
             println!("  herdr task attach {slug}");
@@ -727,6 +758,28 @@ fn crew_assignment(host: &str) -> std::io::Result<Option<RoleAssignment>> {
     }
 }
 
+fn crew_models(host: &str) -> Result<tasks::ModelPins, String> {
+    let content = read_evidence_file(host, "models")
+        .map_err(|err| err.to_string())??
+        .ok_or("sandbox predates model pins (models file missing); recreate the task")?;
+    tasks::parse_models(&content).map_err(|err| format!("invalid sandbox model pins: {err}"))
+}
+
+fn probe_model(host: &str, role: &str) -> Result<(), String> {
+    let helper = format!("{CREW_DIR}/bin/crew_models.py");
+    let output = ssh_capture(
+        host,
+        &tasks::remote_command(&["python3", &helper, "probe", "--role", role]),
+    )
+    .map_err(|err| err.to_string())?;
+    if output.exit_code != 0 {
+        return Err(format!("model verification failed (exit {}): {} {}; close the {role} pane and rerun, or recreate the task",
+            output.exit_code, output.stdout.trim(), output.stderr.trim()));
+    }
+    println!("{}", output.stdout.trim());
+    Ok(())
+}
+
 /// Make sure a named crew agent is running inside the sandbox, creating a tab
 /// and starting the assigned agent kind when missing.
 fn ensure_agent(
@@ -735,17 +788,47 @@ fn ensure_agent(
     roles: &RoleAssignment,
     workdir: &str,
 ) -> Result<(), String> {
-    let exists = ssh_herdr_json(host, &["agent", "get", role])
-        .map_err(|err| err.to_string())?
-        .is_ok();
-    if exists {
-        dismiss_codex_update(host, role)?;
-        return Ok(());
+    let pins = crew_models(host)?;
+    let helper = format!("{CREW_DIR}/bin/crew_models.py");
+    let helper_check = ssh_capture(host, &format!("test -r {}", shell_quote(&helper)))
+        .map_err(|err| err.to_string())?;
+    if helper_check.exit_code != 0 {
+        return Err(
+            "sandbox predates model pins (crew_models.py missing); recreate the task".into(),
+        );
     }
-
     let Some(kind) = roles.kind_for(role) else {
         return Err(format!("no kind assigned for role {role}"));
     };
+    let passthrough = tasks::agent_start_args(kind, &pins);
+    if passthrough.is_empty() {
+        return Err(format!("unsupported crew agent kind: {kind}"));
+    }
+    if ssh_herdr_json(host, &["agent", "get", role])
+        .map_err(|err| err.to_string())?
+        .is_ok()
+    {
+        dismiss_codex_update(host, role)?;
+        let info =
+            ssh_herdr_json(host, &["agent", "get", role]).map_err(|err| err.to_string())??;
+        if info.pointer("/result/agent/agent").and_then(|v| v.as_str()) != Some(kind) {
+            return Err(format!("{role} kind differs from assignment; close the {role} pane and rerun, or recreate the task"));
+        }
+        return match info
+            .pointer("/result/agent/agent_status")
+            .and_then(|v| v.as_str())
+        {
+            Some("working") => {
+                eprintln!("warning: {role} model not verified (busy)");
+                Ok(())
+            }
+            Some("idle" | "done") => probe_model(host, role),
+            _ => Err(format!(
+                "{role} is not ready for model verification; inspect its pane"
+            )),
+        };
+    }
+
     println!("starting {role} ({kind})...");
     let workspaces =
         ssh_herdr_json(host, &["workspace", "list"]).map_err(|err| err.to_string())??;
@@ -793,7 +876,8 @@ fn ensure_agent(
     };
 
     let timeout = AGENT_START_TIMEOUT_MS.to_string();
-    let mut start_args = vec![
+    let mut argv = vec![
+        "herdr",
         "agent",
         "start",
         role,
@@ -803,27 +887,10 @@ fn ensure_agent(
         &pane_id,
         "--timeout",
         &timeout,
+        "--",
     ];
-    // pi is the Google-models member and pins the crew model configured by the
-    // kit. The variable expands in the sandbox shell, so it stays outside the
-    // quoted argv.
-    let start_remote = if kind == "pi" {
-        let mut argv = vec!["herdr"];
-        argv.extend_from_slice(&start_args);
-        format!(
-            "{} -- --provider google --model \"${{HERDR_CREW_GEMINI_MODEL:-gemini-3.8-flash}}\"",
-            tasks::remote_command(&argv)
-        )
-    } else {
-        let mut argv = vec!["herdr"];
-        argv.append(&mut start_args);
-        if kind == "codex" {
-            // Crew CLI updates belong to template maintenance, not an unattended
-            // startup menu. This also protects existing sandbox configurations.
-            argv.extend(["--", "-c", "check_for_update_on_startup=false"]);
-        }
-        tasks::remote_command(&argv)
-    };
+    argv.extend(passthrough.iter().map(String::as_str));
+    let start_remote = tasks::remote_command(&argv);
     let output = ssh_capture(host, &start_remote).map_err(|err| err.to_string())?;
     if output.exit_code != 0 {
         return Err(format!(
@@ -836,7 +903,7 @@ fn ensure_agent(
             }
         ));
     }
-    Ok(())
+    probe_model(host, role)
 }
 
 /// Recover only the known updater menu in older crew images. Never press

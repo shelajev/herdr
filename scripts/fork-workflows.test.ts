@@ -186,6 +186,26 @@ describe("crew kit declaration", () => {
   const kitUrl = new URL("../kits/herdr-crew/spec.yaml", import.meta.url);
   const spec: any = Bun.YAML.parse(readFileSync(kitUrl, "utf8"));
 
+  test("pins all crew starts from one models file", () => {
+    expect(spec.args.claude_model.default).toBe("claude-opus-5-5");
+    expect(spec.args.codex_model.default).toBe("gpt-6.1-sol");
+    expect(spec.args.pi_provider.default).toBe("google");
+    expect(spec.args.gemini_model.default).toBe("gemini-3.8-flash");
+    expect(spec.environment.variables.HERDR_CREW_CLAUDE_MODEL).toBe("${{ kit.args.claude_model }}");
+    expect(spec.environment.variables.HERDR_CREW_CODEX_MODEL).toBe("${{ kit.args.codex_model }}");
+    expect(spec.environment.variables.HERDR_CREW_PI_PROVIDER).toBe("${{ kit.args.pi_provider }}");
+    const models = spec.setup.files.find((file: any) => file.path === "/home/agent/crew/models");
+    expect(models.content).toBe("claude=${{ kit.args.claude_model }},codex=${{ kit.args.codex_model }},pi=${{ kit.args.pi_provider }}/${{ kit.args.gemini_model }}");
+    const rest = structuredClone(spec);
+    delete rest.args;
+    delete rest.environment;
+    rest.setup.files = rest.setup.files.filter((file: any) => file.path !== models.path);
+    for (const pin of ["claude-opus-5-5", "gpt-6.1-sol", "gemini-3.8-flash"]) {
+      expect(JSON.stringify(rest)).not.toContain(pin);
+    }
+    expect(JSON.stringify(spec.setup.install)).toContain("command -v python3");
+  });
+
   test("keeps the published schema version", () => {
     expect(spec.schemaVersion).toBe("2");
     expect(spec.kind).toBe("sandbox");

@@ -12,6 +12,126 @@ pub(crate) const TASK_SANDBOX_PREFIX: &str = "herdr-task-";
 pub(crate) const DEFAULT_KIT: &str = "docker.io/olegselajev241/herdr-crew-kit:latest";
 pub(crate) const KIT_ENV_VAR: &str = "HERDR_TASK_KIT";
 
+/// Sandbox-owned pins. The kit's models file is the only source of defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelPins {
+    pub claude: String,
+    pub codex: String,
+    pub pi_provider: String,
+    pub pi_model: String,
+}
+
+impl ModelPins {
+    pub(crate) fn file_value(&self) -> String {
+        format!(
+            "claude={},codex={},pi={}/{}",
+            self.claude, self.codex, self.pi_provider, self.pi_model
+        )
+    }
+}
+
+pub(crate) fn validate_model_value(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b))
+    {
+        return Err("model values must match [A-Za-z0-9._:/-]+".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_models(value: &str) -> Result<ModelPins, String> {
+    let (mut claude, mut codex, mut pi) = (None, None, None);
+    for pair in value.trim_end_matches(['\r', '\n']).split(',') {
+        let (kind, model) = pair
+            .split_once('=')
+            .ok_or("models must contain kind=model pairs")?;
+        validate_model_value(model)?;
+        let slot = match kind {
+            "claude" => &mut claude,
+            "codex" => &mut codex,
+            "pi" => &mut pi,
+            _ => return Err(format!("unknown model kind: {kind}")),
+        };
+        if slot.replace(model.to_string()).is_some() {
+            return Err(format!("duplicate model kind: {kind}"));
+        }
+    }
+    let (Some(claude), Some(codex), Some(pi)) = (claude, codex, pi) else {
+        return Err("models must assign claude, codex, and pi".into());
+    };
+    let (provider, model) = pi
+        .split_once('/')
+        .ok_or("pi model must include provider/model")?;
+    validate_model_value(provider)?;
+    validate_model_value(model)?;
+    Ok(ModelPins {
+        claude,
+        codex,
+        pi_provider: provider.into(),
+        pi_model: model.into(),
+    })
+}
+
+pub(crate) fn agent_start_args(kind: &str, pins: &ModelPins) -> Vec<String> {
+    match kind {
+        "claude" => vec!["--model".into(), pins.claude.clone()],
+        "codex" => vec![
+            "-m".into(),
+            pins.codex.clone(),
+            "-c".into(),
+            "check_for_update_on_startup=false".into(),
+        ],
+        "pi" => vec![
+            "--provider".into(),
+            pins.pi_provider.clone(),
+            "--model".into(),
+            pins.pi_model.clone(),
+        ],
+        _ => Vec::new(), // The caller refuses unsupported crew kinds before starting.
+    }
+}
+
+/// Creation overrides stay separate from role assignment and contain no defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ModelOverrides {
+    pub claude: Option<String>,
+    pub codex: Option<String>,
+    pub pi_provider: Option<String>,
+    pub pi_model: Option<String>,
+}
+
+impl ModelOverrides {
+    pub(crate) fn with_fallback(self, fallback: Self) -> Self {
+        Self {
+            claude: self.claude.or(fallback.claude),
+            codex: self.codex.or(fallback.codex),
+            pi_provider: self.pi_provider.or(fallback.pi_provider),
+            pi_model: self.pi_model.or(fallback.pi_model),
+        }
+    }
+
+    pub(crate) fn kit_args(&self) -> Result<Vec<String>, String> {
+        let mut args = Vec::new();
+        for (name, value) in [
+            ("claude_model", &self.claude),
+            ("codex_model", &self.codex),
+            ("pi_provider", &self.pi_provider),
+            ("gemini_model", &self.pi_model),
+        ] {
+            if let Some(value) = value {
+                validate_model_value(value)?;
+                if name == "pi_provider" && value.contains('/') {
+                    return Err("pi provider cannot contain '/'".into());
+                }
+                args.extend(["--kit-arg".into(), format!("{name}={value}")]);
+            }
+        }
+        Ok(args)
+    }
+}
+
 /// Crew role assignment for one task. Each role names an agent kind.
 ///
 /// The orchestrator holds the goal and coordinates the crew from *inside* the
@@ -168,6 +288,7 @@ pub(crate) fn sbx_create_argv(
     slug: &str,
     roles: &RoleAssignment,
     mixins: &[String],
+    model_args: &[String],
 ) -> Vec<String> {
     let mut argv = vec![
         "sbx".to_string(),
@@ -181,6 +302,7 @@ pub(crate) fn sbx_create_argv(
         "--kit-arg".to_string(),
         format!("roles={}", roles.kit_arg()),
     ];
+    argv.extend_from_slice(model_args);
     for mixin in mixins {
         argv.push("--kit".to_string());
         argv.push(mixin.clone());
@@ -739,10 +861,110 @@ mod tests {
     }
 
     #[test]
+    fn model_pins_round_trip_and_produce_explicit_start_arguments() {
+        let text = "claude=claude-opus-5-5,codex=gpt-6.1-sol,pi=google/gemini-3.8-flash";
+        let pins = parse_models(text).expect("valid pins");
+        assert_eq!(pins.file_value(), text);
+        assert_eq!(
+            parse_models(&format!("{text}\n")).expect("file newline"),
+            pins
+        );
+        assert_eq!(
+            agent_start_args("claude", &pins),
+            ["--model", "claude-opus-5-5"]
+        );
+        assert_eq!(
+            agent_start_args("codex", &pins),
+            [
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "check_for_update_on_startup=false"
+            ]
+        );
+        assert_eq!(
+            agent_start_args("pi", &pins),
+            ["--provider", "google", "--model", "gemini-3.8-flash"]
+        );
+        assert!(agent_start_args("unknown", &pins).is_empty());
+    }
+
+    #[test]
+    fn model_pins_reject_missing_duplicate_empty_and_shell_hostile_values() {
+        for value in ["", "a b", "x;y", "$(id)", "a\nb"] {
+            assert!(parse_models(&format!("claude={value},codex=b,pi=p/m")).is_err());
+        }
+        for value in [
+            "claude=a,codex=b",
+            "claude=a,codex=b,pi=p/m,pi=p/m",
+            "claude=a,codex=b,pi=/m",
+            "claude=a,codex=b,pi=p/",
+            "unknown=a,codex=b,pi=p/m",
+        ] {
+            assert!(parse_models(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn explicit_model_overrides_win_over_environment_without_host_defaults() {
+        let flags = ModelOverrides {
+            codex: Some("flag-model".into()),
+            ..Default::default()
+        };
+        let env = ModelOverrides {
+            codex: Some("env-model".into()),
+            pi_model: Some("env-pi".into()),
+            ..Default::default()
+        };
+        let result = flags.with_fallback(env);
+        assert_eq!(result.codex.as_deref(), Some("flag-model"));
+        assert_eq!(result.pi_model.as_deref(), Some("env-pi"));
+        assert_eq!(result.claude, None);
+        assert_eq!(result.pi_provider, None);
+    }
+
+    #[test]
+    fn model_overrides_are_opt_in_validated_kit_arguments() {
+        assert!(ModelOverrides::default()
+            .kit_args()
+            .expect("no defaults")
+            .is_empty());
+        let overrides = ModelOverrides {
+            claude: Some("other-claude".into()),
+            codex: Some("other-codex".into()),
+            pi_provider: Some("other-provider".into()),
+            pi_model: Some("other-model".into()),
+        };
+        let args = overrides.kit_args().expect("valid overrides");
+        assert_eq!(
+            args,
+            [
+                "--kit-arg",
+                "claude_model=other-claude",
+                "--kit-arg",
+                "codex_model=other-codex",
+                "--kit-arg",
+                "pi_provider=other-provider",
+                "--kit-arg",
+                "gemini_model=other-model"
+            ]
+        );
+        let roles = rotation_for("demo");
+        let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &[], &args);
+        assert!(argv.ends_with(&args));
+        assert!(ModelOverrides {
+            codex: Some("$(id)".into()),
+            ..Default::default()
+        }
+        .kit_args()
+        .is_err());
+    }
+
+    #[test]
     fn sbx_create_argv_provisions_named_sandbox_with_roles_and_mixins() {
         let roles = parse_roles("orchestrator=gemini,planner=gemini,implementer=codex,qc=claude")
             .expect("valid roles should parse");
-        let argv = sbx_create_argv("./kits/herdr-crew/", "/work/repo", "demo", &roles, &[]);
+        let argv = sbx_create_argv("./kits/herdr-crew/", "/work/repo", "demo", &roles, &[], &[]);
         assert_eq!(
             argv,
             [
@@ -763,7 +985,14 @@ mod tests {
             "git+https://github.com/shelajev/yt-transcript-sbx-kit.git".to_string(),
             "docker.io/example/other-mixin:1.0".to_string(),
         ];
-        let argv = sbx_create_argv("./kits/herdr-crew/", "/work/repo", "demo", &roles, &mixins);
+        let argv = sbx_create_argv(
+            "./kits/herdr-crew/",
+            "/work/repo",
+            "demo",
+            &roles,
+            &mixins,
+            &[],
+        );
         // Asserted as the trailing flag pairs rather than a fixed index, so
         // inserting another option earlier does not silently need a hand-edited
         // offset here.
@@ -800,7 +1029,7 @@ mod tests {
         // sbx_create_argv cannot quietly drop it.
         let roles = rotation_for("anything");
         for mixins in [vec![], vec!["docker.io/example/mixin:1".to_string()]] {
-            let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &mixins);
+            let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &mixins, &[]);
             assert_eq!(
                 flag_value(&argv, "--skills").as_deref(),
                 Some("off"),
@@ -818,7 +1047,7 @@ mod tests {
             "the default kit must be a published image reference, got {DEFAULT_KIT}"
         );
         let roles = rotation_for("demo");
-        let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &[]);
+        let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &[], &[]);
         assert_eq!(argv[..3], ["sbx", "create", DEFAULT_KIT]);
     }
 

@@ -14,17 +14,25 @@ the goal and arbitrates resources; everything else is yours.
 3. For each of planner, implementer, and qc, create a tab in the workspace
    (`herdr tab create --cwd <workspace> --label <role> --no-focus`), take
    `.result.root_pane.pane_id` from its JSON output, and start a named agent
-   of the assigned kind in it:
+   of the assigned kind through the shared model helper:
 
    ```bash
-   herdr agent start planner --kind codex --pane <pane-id> --timeout 240000
+   python3 /home/agent/crew/bin/crew_models.py start --role planner --kind codex --pane <pane-id>
+   python3 /home/agent/crew/bin/crew_models.py probe --role planner
    ```
 
-   For a `codex` role, suppress the interactive updater (the crew template
-   owns CLI updates): append `-- -c check_for_update_on_startup=false`.
-
-   For a `pi` role (the Google-models member), pin the crew model:
-   `herdr agent start qc --kind pi --pane <pane-id> --timeout 240000 -- --provider google --model "$HERDR_CREW_GEMINI_MODEL"`.
+   Use each role's assigned kind, and verify each worker before delivering work.
+   The helper reads `/home/agent/crew/models`, the authoritative pins; never
+   hand-write model arguments or replace an unavailable model. If start or probe
+   exits nonzero, append its sanitized error class to `escalations.md`, record
+   the failure in `status.md`, append `RESULT: FAILED`, and stop. Exit 30 means
+   model mismatch, 31 provider/availability failure, 32 missing model evidence,
+   33 an old kit without a models file, and 34 a native delivery failure.
+   The probe retries a missed native delivery at most twice, only while the
+   same terminal is idle and no session contains its nonce. It never retries
+   a provider rejection. Preserve any `native_delivery_retry` lines as
+   recovered attempts in the model-check report. Never treat a catalog listing as
+   successful verification. The host verifies the orchestrator the same way.
 
 ## Goal intake
 

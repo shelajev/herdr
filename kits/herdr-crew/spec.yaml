@@ -22,6 +22,15 @@ args:
   roles:
     default: orchestrator=claude,planner=codex,implementer=claude,qc=pi
     description: Role assignment for this task; the host rotates this per task and guarantees qc differs from implementer
+  claude_model:
+    default: claude-opus-5-5
+    description: Model passed explicitly to Claude Code
+  codex_model:
+    default: gpt-6.1-sol
+    description: Model passed explicitly to Codex
+  pi_provider:
+    default: google
+    description: Provider paired with the pi model
   gemini_model:
     default: gemini-3.8-flash
     description: Google model the pi role pins with --provider google --model
@@ -158,6 +167,9 @@ environment:
   variables:
     IS_SANDBOX: "1"
     HERDR_CREW: "1"
+    HERDR_CREW_CLAUDE_MODEL: "${{ kit.args.claude_model }}"
+    HERDR_CREW_CODEX_MODEL: "${{ kit.args.codex_model }}"
+    HERDR_CREW_PI_PROVIDER: "${{ kit.args.pi_provider }}"
     HERDR_CREW_GEMINI_MODEL: "${{ kit.args.gemini_model }}"
     CODEX_HOME: /home/agent/.codex
     # git must never block on an interactive credential prompt in a headless
@@ -168,6 +180,9 @@ setup:
   install:
     # Fast: tools are baked into the template image; this only verifies them
     # and fails creation early with a clear message on a wrong image.
+    - command: command -v python3 >/dev/null
+      user: "1000"
+      description: Verify Python is available for crew model and phase helpers
     - command: crew-check
       user: "1000"
       description: Verify herdr and the crew agent CLIs are present
@@ -261,6 +276,9 @@ setup:
       background: true
       description: Keep the headless herdr server running in detached sandboxes
   files:
+    - path: /home/agent/crew/models
+      content: "claude=${{ kit.args.claude_model }},codex=${{ kit.args.codex_model }},pi=${{ kit.args.pi_provider }}/${{ kit.args.gemini_model }}"
+      description: Authoritative model pins for all crew start paths
     - path: /home/agent/crew/assignment
       content: "${{ kit.args.roles }}"
       description: Role-to-agent assignment for this task
