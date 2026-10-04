@@ -281,8 +281,11 @@ describe("crew kit declaration", () => {
   test("boots from a published image and never builds one at creation", () => {
     expect(spec.sandbox.image).toBe("${{ kit.args.image }}");
     expect(spec.args.image.default).toMatch(/^docker\.io\//);
-    expect(spec.args.image.default).toBe("docker.io/olegselajev241/herdr-crew:0.5.0");
+    expect(spec.args.image.default).toBe("docker.io/olegselajev241/herdr-crew:0.5.1");
     expect(spec.sandbox.build).toBeUndefined();
+    // 0.5.1 is a candidate until the host builds and publishes it.
+    expect(spec.args.image.description).not.toContain("(published");
+    expect(spec.args.image.description).toContain("candidate");
   });
 
   test("supervises the server with a real request in detached sandboxes", () => {
@@ -300,6 +303,32 @@ describe("crew kit declaration", () => {
   test("disables the Codex startup updater an unattended crew cannot answer", () => {
     const install = JSON.stringify(spec.setup.install);
     expect(install).toContain("check_for_update_on_startup = false");
+  });
+
+  test("trusts only the task workspace in Codex, never a blanket path", () => {
+    const step = spec.setup.install.find((entry: any) =>
+      entry.description.startsWith("Seed Codex trust"),
+    );
+    expect(step).toBeDefined();
+    expect(step.user).toBe("agent");
+    // WORKSPACE_DIR is the single source; kits-v2 documents WORKDIR as the
+    // template workdir (also the install cwd), so neither it nor pwd is read.
+    expect(step.command).toContain('raw="${WORKSPACE_DIR:-}"');
+    expect(step.command).not.toContain("WORKDIR");
+    expect(step.command).not.toContain("pwd");
+    // The trusted path must be the validated directory, and messages must not
+    // interpret backslash sequences from the path (sh's echo does).
+    expect(step.command).toContain('-ef "$raw"');
+    expect(step.command).not.toMatch(/\becho\b/);
+    // Never the agent's home or its ancestors, nor a system root.
+    expect(step.command).toContain("agent home directory or an ancestor");
+    expect(step.command).toContain("/home | /tmp | /usr | /etc | /var | /root");
+    expect(step.command).toContain("readlink -f");
+    // An unusable workspace must fail the install, not warn and succeed.
+    expect(step.command).not.toContain("exit 0");
+    expect(step.command).toContain('trust_level = "trusted"');
+    expect(step.command).not.toContain('projects."/"');
+    expect(step.command).not.toContain("WORKSPACE_DIR:-/");
   });
 
   test("hands the host the paths it reads back", () => {

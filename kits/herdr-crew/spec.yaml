@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: sandbox
 name: herdr-crew
-version: "0.5.0"
+version: "0.5.1"
 displayName: Herdr Crew
 description: |
   Task sandbox running a nested Herdr server and a crew of coding agents
@@ -17,8 +17,8 @@ sourceURL: https://github.com/shelajev/herdr
 # must be prebuilt — see scripts/sbx/build-crew-template.sh.
 args:
   image:
-    default: docker.io/olegselajev241/herdr-crew:0.5.0
-    description: Herdr crew template image (published, linux/arm64; for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh)
+    default: docker.io/olegselajev241/herdr-crew:0.5.1
+    description: Herdr crew template image. The 0.5.1 default is published for linux/arm64 (digest sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f), but this kit version is still an unpublished candidate, and promotion waits for real sandbox acceptance; for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh
   roles:
     default: orchestrator=claude,planner=codex,implementer=claude,qc=pi
     description: Role assignment for this task; the host rotates this per task and guarantees qc differs from implementer
@@ -264,6 +264,73 @@ setup:
         esac
       user: "agent"
       description: Seed Codex config/auth from SBX_CRED_OPENAI_MODE
+    # Codex 0.153.4 blocks a fresh start in an untrusted directory behind a
+    # "Do you trust the contents of this directory?" dialog that nothing in an
+    # unattended sandbox answers. Trust exactly the task workspace through the
+    # per-project key Codex reads ([projects."<path>"] trust_level). This must
+    # run after the config step above, which rewrites config.toml.
+    # The workspace comes from WORKSPACE_DIR alone, the variable the Claude trust
+    # step above already uses. WORKDIR is deliberately ignored: kits-v2 documents
+    # it as the template workdir (/home/agent/workspace by default), which may
+    # differ from the mounted project
+    # (https://docs.docker.com/ai/sandboxes/customize/kits-v2/), and install
+    # commands also start there, so the step never infers the workspace from its
+    # cwd either. Whether the runtime really sets WORKSPACE_DIR during install is
+    # unverified until the host pair smoke; until then an unusable value fails
+    # the step rather than guessing. WORKSPACE_DIR must be absolute, free of
+    # control characters, resolve (dot segments, symlinks; Codex keys trust by
+    # its canonical cwd) to the same real directory, and not be "/", the agent's
+    # home directory or an ancestor of it, or one of /home /tmp /usr /etc /var
+    # /root (defence in depth, not workspace identity). Messages use printf '%s'
+    # because sh's echo interprets backslash sequences in a path.
+    - command: |
+        set -e
+        fail() {
+          printf 'herdr-crew: %s; cannot seed Codex trust for the task workspace; the host pair smoke must confirm which variable carries the runtime workspace path during install\n' "$*" >&2
+          exit 1
+        }
+        nl=$(printf '\nx')
+        nl=${nl%x}
+        raw="${WORKSPACE_DIR:-}"
+        [ -n "$raw" ] || fail "WORKSPACE_DIR is unset or empty"
+        case "$raw" in
+          *[[:cntrl:]]*) fail "WORKSPACE_DIR contains control characters" ;;
+          /*) ;;
+          *) fail "WORKSPACE_DIR is not an absolute path ('$raw')" ;;
+        esac
+        # The sentinel keeps command substitution from stripping a trailing
+        # newline that belongs to the resolved name; that newline is then seen
+        # by the control-character check instead of silently naming another
+        # directory.
+        ws=$(readlink -f -- "$raw" 2>/dev/null || :; printf x)
+        ws=${ws%x}
+        ws=${ws%"$nl"}
+        [ -n "$ws" ] || fail "WORKSPACE_DIR ('$raw') cannot be resolved (readlink -f failed or is missing)"
+        case "$ws" in
+          /) fail "WORKSPACE_DIR ('$raw') resolves to the filesystem root" ;;
+          *[[:cntrl:]]*) fail "WORKSPACE_DIR ('$raw') resolves to a path with control characters" ;;
+        esac
+        [ -d "$ws" ] || fail "WORKSPACE_DIR ('$raw') is not a directory"
+        # The trusted path must be the very directory that was validated.
+        [ "$ws" -ef "$raw" ] || fail "WORKSPACE_DIR ('$raw') does not resolve to the same directory as its canonical path"
+        home=$(readlink -f -- "${HOME:-/home/agent}" 2>/dev/null) || home=""
+        for h in /home/agent "$home"; do
+          [ -n "$h" ] || continue
+          case "$h/" in
+            "$ws"/*) fail "WORKSPACE_DIR ('$raw') is the agent home directory or an ancestor of it" ;;
+          esac
+        done
+        case "$ws" in
+          /home | /tmp | /usr | /etc | /var | /root) fail "WORKSPACE_DIR ('$raw') is a system directory" ;;
+        esac
+        printf '%s\n' "herdr-crew: seeding Codex trust for $ws (from WORKSPACE_DIR)"
+        esc=$(printf '%s' "$ws" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        header="[projects.\"$esc\"]"
+        if ! grep -qxF "$header" /home/agent/.codex/config.toml; then
+          printf '%s\ntrust_level = "trusted"\n' "$header" >> /home/agent/.codex/config.toml
+        fi
+      user: "agent"
+      description: Seed Codex trust for the task workspace only
   startup:
     # The sandbox entrypoint (crew-entry) only runs when someone attaches, so
     # a detached task sandbox needs the herdr server started as a boot
