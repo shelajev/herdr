@@ -134,10 +134,10 @@ by running `herdr update`.
    `:0.5.0` or reuse any published version tag.
 2. Build and publish the template as `docker.io/olegselajev241/herdr-crew:0.5.1`
    and record its digest; this is the candidate kit's image default. The Dockerfile
-   installs Node.js `22.22.1` from nodejs.org after verifying its SHA256 (the build
-   needs nodejs.org reachable and fails rather than keep the base image's Node),
-   `crew-check` then fails the build on a Node below the CLI floors. It also keeps
-   `HERDR_VERSION=0.9.3` and pins its CLI build defaults to
+   installs Node.js `22.22.1` from nodejs.org after verifying its SHA256. The build
+   needs nodejs.org reachable and fails rather than keep the base image's Node, and
+   `crew-check` then fails it on a Node below the CLI floors. The Dockerfile also
+   keeps `HERDR_VERSION=0.9.3` and pins its CLI build defaults to
    `CLAUDE_CODE_VERSION=2.1.289`, `CODEX_VERSION=0.153.4` and `PI_VERSION=0.85.1`,
    the CLI versions tested in the development sandbox. Moving its observed inner
    runtime from 0.9.0 to 0.9.3 requires this host-owned rebuild. Source edits do
@@ -147,12 +147,11 @@ by running `herdr update`.
    Model preflight, a change goal, a report-only goal, an override, a rejected model
    and recovery after a resource grant must work before promotion. The same smoke
    must confirm which variable carries the runtime workspace path during install
-   steps: the Codex trust step reads only `WORKSPACE_DIR` and fails loudly, never
-   guessing, when it is unset or not a usable directory. It ignores `WORKDIR`
-   because the
+   steps. The Codex trust step reads only `WORKSPACE_DIR` and fails loudly, never
+   guessing, when it is unset or not a usable directory. It ignores `WORKDIR`: the
    [kits-v2 reference](https://docs.docker.com/ai/sandboxes/customize/kits-v2/)
-   documents that as the template workdir, where install commands also start,
-   and it may differ from the mounted project.
+   documents that as the template workdir, where install commands also start, and
+   the template workdir may differ from the mounted project.
 4. Only after that pair passes, move `:latest` and install the new driver together,
    with no old tasks in flight. Retain the previous host artifact for rollback.
 

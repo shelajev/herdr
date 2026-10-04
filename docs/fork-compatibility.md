@@ -72,8 +72,9 @@ hid failed or blank version output. A fresh Codex 0.153.4 start in the task work
 also stops at the trust dialog. The source kit is therefore the corrected candidate
 0.5.1: it pins Node.js 22.22.1 (checksum-verified from nodejs.org), makes `crew-check`
 truthful and enforces the Node floors, and trusts only the task workspace in Codex.
-The 2026-10-03 inventory records published kit 0.4.5. The candidate adds a models file, pinned starts and
-response probes, run acknowledgments, native phase recovery and schema-v2 QC.
+The 2026-10-03 inventory records published kit 0.4.5. The candidate adds a models
+file, pinned starts and response probes, run acknowledgments, native phase recovery
+and schema-v2 QC.
 An old kit lacks these files; the candidate host refuses it. An old host cannot
 supply the new run/ACK protocol and may still trust a prose DONE result.
 

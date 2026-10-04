@@ -10,10 +10,10 @@ The installed-state inventory and earlier validation below are dated records.
 The development sandbox inspected on 2026-10-04 has inner herdr 0.9.0 and the
 old kit protocol, without the candidate's models file, run acknowledgment or QC
 v2 gate. This work has not rebuilt a template, published a kit or installed a
-host driver. Kit and image 0.5.0 were published and are immutable. They have
-two defects: the image's Node.js 20.19.4 is below what Claude Code 2.1.289 (>=22)
-and pi 0.85.1 (>=22.19) require, and a fresh Codex 0.153.4 start in the task
-workspace stops at the "Do you trust the contents of this directory?" dialog.
+host driver. Kit and image 0.5.0 were published and are immutable, and both
+defects below ship in them. The image's Node.js 20.19.4 is below what Claude Code
+2.1.289 (>=22) and pi 0.85.1 (>=22.19) require, and a fresh Codex 0.153.4 start in
+the task workspace stops at the "Do you trust the contents of this directory?" dialog.
 Source kit 0.5.1 is the corrected candidate: it pins Node.js 22.22.1 from
 nodejs.org with a verified SHA256, makes `crew-check` fail on a missing, failing
 or version-less tool and on a Node below those floors, and trusts only the task
