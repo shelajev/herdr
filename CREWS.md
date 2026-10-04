@@ -17,8 +17,13 @@ the task workspace stops at the "Do you trust the contents of this directory?" d
 Source kit 0.5.1 is the corrected candidate: it pins Node.js 22.22.1 from
 nodejs.org with a verified SHA256, makes `crew-check` fail on a missing, failing
 or version-less tool and on a Node below those floors, and trusts only the task
-workspace in Codex's config. Nothing here has built or published 0.5.1; the
-host builds and publishes the image and kit, then tests the pair.
+workspace in Codex's config. The host has since published the corrected linux/arm64
+image as `docker.io/olegselajev241/herdr-crew:0.5.1` (digest
+`sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`), built from commit
+`616d9593`. The candidate kit is not published, and no `latest` tag or installed
+default has changed. Publishing the kit and promoting it are separate host steps,
+and promotion waits for real sandbox acceptance, which is still pending. Nothing in
+this development sandbox built, published or promoted anything.
 
 The candidate pins Claude Code to `claude-opus-5-5`, Codex to `gpt-6.1-sol`, and
 pi to provider `google` with `gemini-3.8-flash`. Select overrides at creation with

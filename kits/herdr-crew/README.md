@@ -61,7 +61,8 @@ template is rebuilt.
   declares proxy-managed credentials (real API keys never enter the VM) and
   the baseline network allowlist.
 - **Template image** (`template/Dockerfile`, candidate default
-  `docker.io/olegselajev241/herdr-crew:0.5.1`, not published yet, linux/arm64): herdr + Claude
+  `docker.io/olegselajev241/herdr-crew:0.5.1`, published for linux/arm64 with digest
+  `sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`; the kit is not published yet): herdr + Claude
   Code + Codex + pi + beans + a pinned Node.js 22.22.1 baked in so sandbox creation
   is fast; `crew-entry` supervises the headless herdr server.
 - **Crew files** (`/home/agent/crew/` in the sandbox): `assignment`,
@@ -108,10 +109,17 @@ at all.
 
 ### Dated installed-state inventory
 
-This source tree is kit version **0.5.1**, a corrected candidate that is not
+This source tree is kit version **0.5.1**, a corrected candidate whose kit is not
 published yet. Kit and image 0.5.0 are published and immutable; they ship Node.js
 20.19.4, below the floors of Claude Code 2.1.289 (>=22) and pi 0.85.1 (>=22.19),
-and their Codex start stops at the workspace trust dialog. The host inventory
+and their Codex start stops at the workspace trust dialog. The host has since
+published the corrected linux/arm64 image as
+`docker.io/olegselajev241/herdr-crew:0.5.1` (digest
+`sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`), built from the
+independently reviewed Node component at commit `616d9593`. The only later change
+under `template/` is comment text in `crew-check`. No `latest` tag and no installed
+default has changed, and publishing the kit and promoting it are separate host
+steps. The host inventory
 recorded on 2026-10-03 lists host task driver 0.8.2 and published kit 0.4.5
 (`docker.io/olegselajev241/herdr-crew-kit:latest`, also `:0.4.5`). These are dated
 observations, not a claim about what a mutable registry tag resolves to later.
@@ -120,8 +128,8 @@ The development sandbox inspected on 2026-10-04 runs inner herdr 0.9.0 with the
 old role protocol: no run.json/qc.json and no automatic three-model preflight.
 Its installed CLIs are Claude Code 2.1.289, Codex 0.153.4 and pi 0.85.1. Fresh
 isolated probes verified the candidate pins on those CLIs. That does not mean
-earlier crew work ran on those pins, or that a template/kit was rebuilt or
-published. This source work has not installed a new host driver or released a kit.
+earlier crew work ran on those pins, or that this sandbox runs the rebuilt
+template. This source work has not installed a new host driver or released a kit.
 
 ### Candidate promotion requirements
 
@@ -132,12 +140,15 @@ by running `herdr update`.
 
 1. Confirm the intended kit tag, 0.5.1, is unused. Never overwrite `:0.4.5` or
    `:0.5.0` or reuse any published version tag.
-2. Build and publish the template as `docker.io/olegselajev241/herdr-crew:0.5.1`
-   and record its digest; this is the candidate kit's image default. The Dockerfile
-   installs Node.js `22.22.1` from nodejs.org after verifying its SHA256. The build
-   needs nodejs.org reachable and fails rather than keep the base image's Node, and
-   `crew-check` then fails it on a Node below the CLI floors. The Dockerfile also
-   keeps `HERDR_VERSION=0.9.3` and pins its CLI build defaults to
+2. The corrected linux/arm64 template is published as
+   `docker.io/olegselajev241/herdr-crew:0.5.1` with digest
+   `sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`; this is the candidate
+   kit's image default. It was built from the reviewed Node component at commit
+   `616d9593`, and other architectures still need their own build and digest. The
+   Dockerfile installs Node.js `22.22.1` from nodejs.org after verifying its SHA256.
+   The build needs nodejs.org reachable and fails rather than keep the base image's
+   Node, and `crew-check` then fails it on a Node below the CLI floors. The
+   Dockerfile also keeps `HERDR_VERSION=0.9.3` and pins its CLI build defaults to
    `CLAUDE_CODE_VERSION=2.1.289`, `CODEX_VERSION=0.153.4` and `PI_VERSION=0.85.1`,
    the CLI versions tested in the development sandbox. Moving its observed inner
    runtime from 0.9.0 to 0.9.3 requires this host-owned rebuild. Source edits do

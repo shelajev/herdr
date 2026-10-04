@@ -45,7 +45,7 @@ Verified on the host, 2026-10-03:
 | Installed host task driver | `/Users/shelajev/.local/bin/herdr-dev`, reports `herdr 0.8.2` |
 | Its source | `dd4e3770` plus uncommitted repairs — not a clean source commit |
 | Its SHA256 | `1f000cfe4d0380ee2d17a46cd38f5ff641984b110ecc1f90c30a64dffe2af39e` |
-| Kit version in this source tree | 0.5.1 — **not published** (0.5.0 is published and immutable) |
+| Kit version in this source tree | 0.5.1 — kit **not published**, image published for linux/arm64 (0.5.0 is published and immutable) |
 | Published kit | `herdr-crew-kit:latest` = version 0.4.5 |
 | Published kit digest (`:latest`) | `sha256:dbeb8b7c4ba2441d3f21d61430e9b5595fdc10f42ef95071d0a0890121de3afe` |
 | Published kit digest (`:0.4.5`) | `sha256:4b28f8d50e028d6bbb8407a14dc1a7d0f549ce236338d8b2fd7dd5afe3594753` |
@@ -78,13 +78,22 @@ and schema-v2 QC.
 An old kit lacks these files; the candidate host refuses it. An old host cannot
 supply the new run/ACK protocol and may still trust a prose DONE result.
 
-Promotion requires a tested driver/kit pair. The host must confirm 0.5.1 is
-unused before publishing it, and must build the template image before the kit;
-neither step happened here. Do not overwrite 0.4.5, 0.5.0 or any other
-already-published version tag. Publish a candidate tag for testing, then
+The host has since published the corrected linux/arm64 image as
+`docker.io/olegselajev241/herdr-crew:0.5.1` (digest
+`sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f`). It was built from the
+independently reviewed Node component at commit `616d9593`. The only later change
+under `kits/herdr-crew/template/` is comment text in `crew-check`; the Dockerfile
+and every non-comment line are identical. The candidate kit is not published, and
+no `latest` tag or installed default has changed.
+
+Publishing the candidate kit and promoting it are separate host steps. Promotion
+requires a tested driver/kit pair and waits for real sandbox acceptance, which is
+still pending. The host must confirm the kit tag 0.5.1 is unused before publishing
+it. Do not overwrite 0.4.5, 0.5.0 or any other already-published version tag.
+Publish a candidate tag for testing, then
 use `HERDR_TASK_KIT` to select that exact reference with the new driver. Only
 after end-to-end checks pass should the host drain old tasks, move `:latest` and
-install the new driver together. None of those publication steps happened here.
+install the new driver together. None of those promotion steps has happened, and nothing in this development sandbox built, published or promoted anything.
 
 The [kit README](../kits/herdr-crew/README.md) explains model overrides,
 `--report-only`, native recovery and ordinary `task goal` resume after a resource

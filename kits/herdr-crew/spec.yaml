@@ -18,7 +18,7 @@ sourceURL: https://github.com/shelajev/herdr
 args:
   image:
     default: docker.io/olegselajev241/herdr-crew:0.5.1
-    description: Herdr crew template image. The 0.5.1 default is a candidate that must be built and published by the host before a task sandbox can use it; for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh
+    description: Herdr crew template image. The 0.5.1 default is published for linux/arm64 (digest sha256:45787cc3a320ee7677a1ca248beff29093d78748a30bbf6b7f7a4bae9eca230f), but this kit version is still an unpublished candidate, and promotion waits for real sandbox acceptance; for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh
   roles:
     default: orchestrator=claude,planner=codex,implementer=claude,qc=pi
     description: Role assignment for this task; the host rotates this per task and guarantees qc differs from implementer
