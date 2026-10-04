@@ -103,10 +103,17 @@ A dead model must never stall the task silently:
 accepts a run only when QC has written `/home/agent/crew/qc.json` for the
 current run and the exact current commit. So the order matters:
 
-1. The implementer commits its work and stops editing.
-2. QC reviews that commit, runs checks, and writes `qc.json` itself. Only QC
+1. Read scope from the host's `run.json`. For `change`, the implementer commits
+   any outstanding work and stops editing. No extra commit is required when
+   the current clean commit already satisfies the goal. For `report-only`, it makes
+   no commit, reports that in status.md, and stops; HEAD stays at the base.
+2. QC round N reviews the clean commit, runs checks, and writes schema v2
+   `qc.json` with scope, base, review window and recovered attempts. Only QC
    writes that file — never write it on QC's behalf, and never edit it.
-3. Only then append `RESULT: DONE`.
+3. Record the completed QC phase with `crew_phase.py record` once the phase
+   helper is installed. This is serial: implementation stops, QC round N
+   finishes, then its phase is recorded. Do not record an unfinished review.
+4. Only then append `RESULT: DONE`.
 
 If anything is edited or committed after QC's report, the report is void: send
 the work back for another implement-then-review round. A report from a previous

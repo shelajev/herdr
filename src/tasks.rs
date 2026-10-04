@@ -401,7 +401,7 @@ pub(crate) fn parse_result(status: &str) -> Option<TaskResult> {
 // reviewed repository, so it never lands in a commit and never touches the
 // frozen client endpoint contract:
 //
-// * `run.json` — written by the *host* immediately before a goal is delivered.
+// * `run.json` — written by the *host* immediately before a new run starts.
 //   It mints a fresh run id, so evidence from an earlier run cannot be reused.
 // * `qc.json`  — written by the *QC agent* after it actually ran the checks.
 //
@@ -412,11 +412,36 @@ pub(crate) fn parse_result(status: &str) -> Option<TaskResult> {
 /// other version is rejected as unsupported rather than best-effort parsed: a
 /// newer coordinator must not be able to talk an older host into accepting a
 /// report whose meaning it does not know.
-pub(crate) const EVIDENCE_VERSION: u64 = 1;
+pub(crate) const EVIDENCE_VERSION: u64 = 2;
 
 /// Crew-directory file names for the two evidence artifacts.
 pub(crate) const RUN_METADATA_FILE: &str = "run.json";
 pub(crate) const QC_EVIDENCE_FILE: &str = "qc.json";
+
+/// Host-selected scope; the crew must echo it rather than choose its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunScope {
+    Change,
+    ReportOnly,
+}
+
+impl RunScope {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::ReportOnly => "report-only",
+        }
+    }
+    fn parse(value: &serde_json::Value) -> Result<Self, EvidenceError> {
+        match required_str(value, "scope")?.as_str() {
+            "change" => Ok(Self::Change),
+            "report-only" => Ok(Self::ReportOnly),
+            _ => Err(EvidenceError::Malformed(
+                "scope must be change or report-only".into(),
+            )),
+        }
+    }
+}
 
 /// Host-minted identity for one goal delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,18 +449,20 @@ pub(crate) struct RunMetadata {
     pub run_id: String,
     pub goal_digest: String,
     pub workspace: String,
+    pub base_commit: String,
+    pub scope: RunScope,
 }
 
 impl RunMetadata {
     /// Serialize for the crew directory. Written by the host before prompting.
     pub(crate) fn to_json(&self) -> String {
-        format!(
-            "{{\n  \"version\": {},\n  \"run_id\": {},\n  \"goal_digest\": {},\n  \"workspace\": {}\n}}\n",
-            EVIDENCE_VERSION,
-            json_string(&self.run_id),
-            json_string(&self.goal_digest),
-            json_string(&self.workspace),
-        )
+        serde_json::json!({
+            "version": EVIDENCE_VERSION, "run_id": self.run_id,
+            "goal_digest": self.goal_digest, "workspace": self.workspace,
+            "base_commit": self.base_commit, "scope": self.scope.as_str(),
+        })
+        .to_string()
+            + "\n"
     }
 
     pub(crate) fn parse(raw: &str) -> Result<Self, EvidenceError> {
@@ -446,14 +473,21 @@ impl RunMetadata {
             run_id: required_str(&value, "run_id")?,
             goal_digest: required_str(&value, "goal_digest")?,
             workspace: required_str(&value, "workspace")?,
+            base_commit: required_str(&value, "base_commit")?,
+            scope: RunScope::parse(&value)?,
         })
     }
 }
 
-/// Mint run metadata for a goal delivery. The run id embeds a wall-clock
+/// Mint run metadata for each goal delivery. The run id embeds a wall-clock
 /// nanosecond stamp and a digest of the goal and workspace, so two deliveries
 /// never share an id even for an identical goal.
-pub(crate) fn new_run_metadata(goal: &str, workspace: &str) -> RunMetadata {
+pub(crate) fn new_run_metadata(
+    goal: &str,
+    workspace: &str,
+    base_commit: &str,
+    scope: RunScope,
+) -> RunMetadata {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
@@ -467,6 +501,8 @@ pub(crate) fn new_run_metadata(goal: &str, workspace: &str) -> RunMetadata {
         run_id,
         goal_digest,
         workspace: workspace.to_string(),
+        base_commit: base_commit.to_string(),
+        scope,
     }
 }
 
@@ -504,17 +540,41 @@ impl QcCheck {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QcReview {
+    pub started_commit: String,
+    pub finished_commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QcAttempt {
+    pub name: String,
+    pub command: String,
+    pub outcome: String,
+    pub exit_code: Option<i64>,
+    pub reason: String,
+    pub superseded_by: String,
+}
+
 /// A QC report about one exact commit of one exact run.
+/// Reported kinds describe assigned workflow roles, not authenticated writers.
+/// Independence is a property of the assignment, not a cryptographic guarantee
+/// between same-UID processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QcEvidence {
     pub run_id: String,
     pub goal_digest: String,
     pub workspace: String,
+    pub base_commit: String,
+    pub scope: RunScope,
     pub commit: String,
     pub verdict: String,
     pub implementer: String,
     pub qc: String,
     pub checks: Vec<QcCheck>,
+    pub round: u64,
+    pub review: QcReview,
+    pub attempts: Vec<QcAttempt>,
 }
 
 /// Why a DONE could not be accepted. Every variant is a refusal: there is no
@@ -532,7 +592,7 @@ pub(crate) enum EvidenceError {
     Stale(String),
     /// Evidence names a commit that is not the current reviewed HEAD.
     CommitMismatch { reported: String, actual: String },
-    /// The workspace has tracked changes, so no commit describes its state.
+    /// The workspace has tracked or untracked changes, so no commit describes its state.
     DirtyWorktree(String),
     /// QC did not pass, or did not actually run what acceptance requires.
     NotAccepted(String),
@@ -551,7 +611,7 @@ impl std::fmt::Display for EvidenceError {
             Self::UnsupportedVersion(version) => write!(
                 formatter,
                 "QC evidence declares schema version {version}, but this herdr implements \
-                 v{EVIDENCE_VERSION}; refusing to guess what it means"
+                 v{EVIDENCE_VERSION}; regenerate with a current kit"
             ),
             Self::Stale(detail) => write!(formatter, "QC evidence is stale: {detail}"),
             Self::CommitMismatch { reported, actual } => write!(
@@ -561,7 +621,7 @@ impl std::fmt::Display for EvidenceError {
             ),
             Self::DirtyWorktree(detail) => write!(
                 formatter,
-                "the workspace has uncommitted tracked changes, so no commit describes what QC \
+                "the workspace has uncommitted changes or untracked files, so no commit describes what QC \
                  reviewed: {detail}"
             ),
             Self::NotAccepted(detail) => write!(formatter, "QC did not accept this run: {detail}"),
@@ -587,15 +647,48 @@ impl QcEvidence {
                 exit_code: entry.get("exit_code").and_then(|code| code.as_i64()),
             });
         }
+        let round = value
+            .get("round")
+            .and_then(|v| v.as_u64())
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| EvidenceError::Malformed("round must be an integer >= 1".into()))?;
+        let review = value
+            .get("review")
+            .ok_or_else(|| EvidenceError::Malformed("missing review".into()))?;
+        let review = QcReview {
+            started_commit: required_str(review, "started_commit")?,
+            finished_commit: required_str(review, "finished_commit")?,
+        };
+        let mut attempts = Vec::new();
+        if let Some(entries) = value.get("attempts") {
+            let entries = entries
+                .as_array()
+                .ok_or_else(|| EvidenceError::Malformed("attempts must be an array".into()))?;
+            for entry in entries {
+                attempts.push(QcAttempt {
+                    name: required_str(entry, "name")?,
+                    command: required_str(entry, "command")?,
+                    outcome: required_str(entry, "outcome")?,
+                    exit_code: entry.get("exit_code").and_then(|v| v.as_i64()),
+                    reason: required_str(entry, "reason")?,
+                    superseded_by: required_str(entry, "superseded_by")?,
+                });
+            }
+        }
         Ok(Self {
             run_id: required_str(&value, "run_id")?,
             goal_digest: required_str(&value, "goal_digest")?,
             workspace: required_str(&value, "workspace")?,
+            base_commit: required_str(&value, "base_commit")?,
+            scope: RunScope::parse(&value)?,
             commit: required_str(&value, "commit")?,
             verdict: required_str(&value, "verdict")?,
             implementer: required_str(&value, "implementer")?,
             qc: required_str(&value, "qc")?,
             checks,
+            round,
+            review,
+            attempts,
         })
     }
 }
@@ -605,10 +698,13 @@ impl QcEvidence {
 /// The gate is deliberately generic: a task sandbox runs whatever repository
 /// and goal the operator gives it, so this cannot require a particular build
 /// or test command. What it requires is that the report belongs to the current
-/// run, names the exact current clean commit, comes from the *configured* QC
-/// role rather than the implementer, and lists checks that actually ran and
+/// run, names the exact current clean commit, reports the configured workflow
+/// role assignments, and lists checks that actually ran and
 /// actually succeeded. Which checks are appropriate is the crew's judgement;
 /// claiming success without any, or alongside a failure, is not.
+/// The reported kinds catch assignment wiring mistakes; they do not authenticate
+/// the writer. Independence belongs to the assignment, not a cryptographic
+/// guarantee between same-UID processes.
 ///
 /// `head` is the workspace's current full commit id and `porcelain` is the
 /// output of `git status --porcelain` read from the same sandbox. Both are
@@ -620,6 +716,7 @@ pub(crate) fn accept_run(
     qc_raw: Option<&str>,
     head: &str,
     porcelain: &str,
+    base_is_ancestor: bool,
 ) -> Result<QcEvidence, EvidenceError> {
     let run = RunMetadata::parse(run_raw.ok_or(EvidenceError::Missing(RUN_METADATA_FILE))?)?;
     let evidence = QcEvidence::parse(qc_raw.ok_or(EvidenceError::Missing(QC_EVIDENCE_FILE))?)?;
@@ -642,6 +739,16 @@ pub(crate) fn accept_run(
         )));
     }
 
+    if evidence.scope != run.scope || evidence.base_commit != run.base_commit {
+        return Err(EvidenceError::Stale(
+            "scope or base_commit differs from run.json".into(),
+        ));
+    }
+    if !is_full_commit_id(&run.base_commit) {
+        return Err(EvidenceError::Malformed(
+            "base_commit must be a full 40-character commit id".into(),
+        ));
+    }
     // A clean tree is a necessary condition, not a proof that nothing was
     // edited between QC and now; the run id and commit comparison carry that.
     if !porcelain.trim().is_empty() {
@@ -674,30 +781,59 @@ pub(crate) fn accept_run(
         });
     }
 
+    for reviewed in [
+        &evidence.review.started_commit,
+        &evidence.review.finished_commit,
+    ] {
+        if !is_full_commit_id(reviewed) {
+            return Err(EvidenceError::Malformed(
+                "review commits must be full 40-character commit ids".into(),
+            ));
+        }
+        if reviewed != head {
+            return Err(EvidenceError::CommitMismatch {
+                reported: reviewed.clone(),
+                actual: head.to_string(),
+            });
+        }
+    }
+    match run.scope {
+        RunScope::Change if !base_is_ancestor => {
+            return Err(EvidenceError::NotAccepted(
+                "change scope requires base_commit to be an ancestor of or equal to HEAD".into(),
+            ));
+        }
+        RunScope::ReportOnly if head != run.base_commit => {
+            return Err(EvidenceError::NotAccepted(
+                "report-only scope requires HEAD == base_commit".into(),
+            ));
+        }
+        _ => {}
+    }
+
     if evidence.verdict != "PASS" {
         return Err(EvidenceError::NotAccepted(format!(
             "verdict is {}",
             evidence.verdict
         )));
     }
-    // Identity is checked against the crew's configured assignment, not merely
-    // for being two different strings: a report may not invent a reviewer, and
-    // the implementer may not sign off on itself under another label.
+    // Reported kinds are workflow assignments checked for wiring mistakes,
+    // not authentication of the writer (all agents share a UID).
     if evidence.implementer != roles.implementer {
         return Err(EvidenceError::NotAccepted(format!(
-            "the report names {} as the implementer, but this task is configured with {}",
+            "the report assigns kind {} to implementer, but this task is configured with {}",
             evidence.implementer, roles.implementer
         )));
     }
     if evidence.qc != roles.qc {
         return Err(EvidenceError::NotAccepted(format!(
-            "the report names {} as QC, but this task is configured with {}",
+            "the report assigns kind {} to QC, but this task is configured with {}",
             evidence.qc, roles.qc
         )));
     }
     if evidence.implementer == evidence.qc {
         return Err(EvidenceError::NotAccepted(format!(
-            "{} reviewed its own work; quality control requires a different model",
+            "{} is assigned to both implementer and QC; quality control requires different kinds",
             evidence.qc
         )));
     }
@@ -725,7 +861,43 @@ pub(crate) fn accept_run(
             )));
         }
     }
+    for attempt in &evidence.attempts {
+        if !matches!(attempt.outcome.as_str(), "blocked" | "failed")
+            || attempt.reason.trim().is_empty()
+            || !evidence
+                .checks
+                .iter()
+                .any(|check| check.name == attempt.superseded_by && check.succeeded())
+        {
+            return Err(EvidenceError::NotAccepted(format!("attempt {:?} needs a blocked/failed outcome, a reason, and superseded_by naming a passed check", attempt.name)));
+        }
+    }
     Ok(evidence)
+}
+
+/// Presentation only: recovered history is separate from current successful checks.
+pub(crate) fn format_qc_evidence(evidence: &QcEvidence) -> String {
+    let mut lines = vec![format!(
+        "  review | scope {} | round {} | commit {}",
+        evidence.scope.as_str(),
+        evidence.round,
+        evidence.review.finished_commit
+    )];
+    for check in &evidence.checks {
+        lines.push(format!("  check | {} | {}", check.name, check.command));
+    }
+    for attempt in &evidence.attempts {
+        lines.push(format!(
+            "  history | {} | {} | {} | exit {:?} | {} | superseded_by {}",
+            attempt.name,
+            attempt.command,
+            attempt.outcome,
+            attempt.exit_code,
+            attempt.reason,
+            attempt.superseded_by
+        ));
+    }
+    lines.join("\n")
 }
 
 /// A full git commit id: exactly 40 lowercase hex digits. Abbreviated ids are
@@ -753,25 +925,6 @@ fn required_str(value: &serde_json::Value, field: &str) -> Result<String, Eviden
         .and_then(|field| field.as_str())
         .map(str::to_string)
         .ok_or_else(|| EvidenceError::Malformed(format!("missing string field {field:?}")))
-}
-
-/// Minimal JSON string escaping for the few host-written fields.
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
 }
 
 #[cfg(test)]
@@ -1077,6 +1230,20 @@ mod tests {
 
     /// A QC report that should be accepted, so each rejection test can change
     /// exactly one thing and attribute the refusal to that change.
+    const BASE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    fn new_run_metadata(goal: &str, workspace: &str) -> RunMetadata {
+        super::new_run_metadata(goal, workspace, BASE, RunScope::Change)
+    }
+    fn accept_run(
+        roles: &RoleAssignment,
+        run: Option<&str>,
+        qc: Option<&str>,
+        head: &str,
+        porcelain: &str,
+    ) -> Result<QcEvidence, EvidenceError> {
+        super::accept_run(roles, run, qc, head, porcelain, true)
+    }
+
     fn crew() -> RoleAssignment {
         parse_roles("orchestrator=codex,planner=codex,implementer=claude,qc=pi")
             .expect("fixture roles")
@@ -1099,11 +1266,266 @@ mod tests {
             .join(",");
         let roles = crew();
         format!(
-            r#"{{"version":1,"run_id":"{run_id}","goal_digest":"{goal_digest}",
+            r#"{{"version":2,"base_commit":"{BASE}","scope":"change","round":1,"review":{{"started_commit":"{commit}","finished_commit":"{commit}"}},"run_id":"{run_id}","goal_digest":"{goal_digest}",
                "workspace":"{workspace}","commit":"{commit}","verdict":"PASS",
                "implementer":"{}","qc":"{}","checks":[{checks}]}}"#,
             roles.implementer, roles.qc
         )
+    }
+
+    fn v2_fixture() -> (RunMetadata, serde_json::Value) {
+        let run = new_run_metadata("ship it", "/workspace");
+        let qc = serde_json::from_str(&good_qc(
+            &run.run_id,
+            &run.goal_digest,
+            &run.workspace,
+            HEAD,
+        ))
+        .unwrap();
+        (run, qc)
+    }
+
+    #[test]
+    fn report_only_accepts_only_the_unchanged_base() {
+        let (mut run, mut qc) = v2_fixture();
+        run.scope = RunScope::ReportOnly;
+        run.base_commit = HEAD.into();
+        qc["scope"] = "report-only".into();
+        qc["base_commit"] = HEAD.into();
+        assert!(super::accept_run(
+            &crew(),
+            Some(&run.to_json()),
+            Some(&qc.to_string()),
+            HEAD,
+            "",
+            false
+        )
+        .is_ok());
+        assert_eq!(RunMetadata::parse(&run.to_json()).unwrap(), run);
+        run.base_commit = BASE.into();
+        qc["base_commit"] = BASE.into();
+        assert!(matches!(
+            accept_run(
+                &crew(),
+                Some(&run.to_json()),
+                Some(&qc.to_string()),
+                HEAD,
+                ""
+            ),
+            Err(EvidenceError::NotAccepted(_))
+        ));
+    }
+
+    #[test]
+    fn change_accepts_the_base_or_a_descendant_but_rejects_unrelated_history() {
+        let (mut run, mut qc) = v2_fixture();
+        // Normal implementation after the base: ancestry is still required.
+        assert!(super::accept_run(
+            &crew(),
+            Some(&run.to_json()),
+            Some(&qc.to_string()),
+            HEAD,
+            "",
+            true
+        )
+        .is_ok());
+        assert!(matches!(
+            super::accept_run(
+                &crew(),
+                Some(&run.to_json()),
+                Some(&qc.to_string()),
+                HEAD,
+                "",
+                false
+            ),
+            Err(EvidenceError::NotAccepted(_))
+        ));
+        // A resource-grant/resume delivery can mint its base at already-completed
+        // work. Fresh independent QC, not a redundant new commit, proves success.
+        run.base_commit = HEAD.into();
+        qc["base_commit"] = HEAD.into();
+        assert!(super::accept_run(
+            &crew(),
+            Some(&run.to_json()),
+            Some(&qc.to_string()),
+            HEAD,
+            "",
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn scope_and_base_must_echo_host_metadata() {
+        let (run, qc) = v2_fixture();
+        for (field, value) in [("scope", "report-only"), ("base_commit", HEAD)] {
+            let mut changed = qc.clone();
+            changed[field] = value.into();
+            assert!(matches!(
+                accept_run(
+                    &crew(),
+                    Some(&run.to_json()),
+                    Some(&changed.to_string()),
+                    HEAD,
+                    ""
+                ),
+                Err(EvidenceError::Stale(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn review_window_must_name_the_current_commit_at_both_ends() {
+        let (run, qc) = v2_fixture();
+        for field in ["started_commit", "finished_commit"] {
+            let mut changed = qc.clone();
+            changed["review"][field] = BASE.into();
+            assert_eq!(
+                accept_run(
+                    &crew(),
+                    Some(&run.to_json()),
+                    Some(&changed.to_string()),
+                    HEAD,
+                    ""
+                ),
+                Err(EvidenceError::CommitMismatch {
+                    reported: BASE.into(),
+                    actual: HEAD.into()
+                })
+            );
+        }
+    }
+
+    fn recovered_attempt() -> serde_json::Value {
+        serde_json::json!({"name":"initial tests", "command":"just ci-tests 'all()'", "outcome":"blocked", "reason":"toolchain missing; installed before retry", "superseded_by":"tests"})
+    }
+
+    #[test]
+    fn recovered_attempts_are_preserved_only_in_history() {
+        let (run, mut qc) = v2_fixture();
+        for outcome in ["blocked", "failed"] {
+            let mut attempt = recovered_attempt();
+            attempt["outcome"] = outcome.into();
+            qc["attempts"] = serde_json::json!([attempt]);
+            let accepted = accept_run(
+                &crew(),
+                Some(&run.to_json()),
+                Some(&qc.to_string()),
+                HEAD,
+                "",
+            )
+            .unwrap();
+            assert_eq!(accepted.checks.len(), 2);
+            assert_eq!(accepted.attempts.len(), 1);
+            let printed = format_qc_evidence(&accepted);
+            assert!(printed.contains("review | scope change | round 1 | commit"));
+            let checks: Vec<_> = printed
+                .lines()
+                .filter(|line| line.contains("check |"))
+                .collect();
+            assert_eq!(checks.len(), 2);
+            assert!(checks.iter().all(|line| !line.contains("initial tests")));
+            let history: Vec<_> = printed
+                .lines()
+                .filter(|line| line.contains("history |"))
+                .collect();
+            assert_eq!(history.len(), 1);
+            assert!(history[0].contains("initial tests"));
+            assert!(history[0].contains(outcome));
+            assert!(history[0].contains("toolchain missing"));
+            assert!(history[0].contains("superseded_by tests"));
+        }
+    }
+
+    #[test]
+    fn unrecovered_or_invalid_attempts_are_refused() {
+        let (run, qc) = v2_fixture();
+        for (field, value) in [
+            ("outcome", "passed"),
+            ("outcome", "skipped"),
+            ("reason", " \t"),
+            ("superseded_by", "missing"),
+            ("superseded_by", ""),
+        ] {
+            let mut changed = qc.clone();
+            let mut attempt = recovered_attempt();
+            attempt[field] = value.into();
+            changed["attempts"] = serde_json::json!([attempt]);
+            assert!(
+                matches!(
+                    accept_run(
+                        &crew(),
+                        Some(&run.to_json()),
+                        Some(&changed.to_string()),
+                        HEAD,
+                        ""
+                    ),
+                    Err(EvidenceError::NotAccepted(_))
+                ),
+                "{field}={value}"
+            );
+        }
+        let mut changed = qc.clone();
+        let mut attempt = recovered_attempt();
+        attempt.as_object_mut().unwrap().remove("superseded_by");
+        changed["attempts"] = serde_json::json!([attempt]);
+        assert!(matches!(
+            accept_run(
+                &crew(),
+                Some(&run.to_json()),
+                Some(&changed.to_string()),
+                HEAD,
+                ""
+            ),
+            Err(EvidenceError::Malformed(_))
+        ));
+        changed["attempts"] = serde_json::json!([recovered_attempt()]);
+        changed["checks"][1]["outcome"] = "failed".into();
+        changed["checks"][1]["exit_code"] = 1.into();
+        assert!(matches!(
+            accept_run(
+                &crew(),
+                Some(&run.to_json()),
+                Some(&changed.to_string()),
+                HEAD,
+                ""
+            ),
+            Err(EvidenceError::NotAccepted(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_v2_fields_and_old_metadata_are_refused() {
+        let (run, qc) = v2_fixture();
+        for (field, value) in [
+            ("round", serde_json::json!(0)),
+            ("round", serde_json::json!(-1)),
+            ("round", serde_json::json!(1.5)),
+            ("scope", serde_json::json!("unknown")),
+            ("attempts", serde_json::Value::Null),
+        ] {
+            let mut changed = qc.clone();
+            changed[field] = value;
+            assert!(matches!(
+                accept_run(
+                    &crew(),
+                    Some(&run.to_json()),
+                    Some(&changed.to_string()),
+                    HEAD,
+                    ""
+                ),
+                Err(EvidenceError::Malformed(_))
+            ));
+        }
+        let mut old: serde_json::Value = serde_json::from_str(&run.to_json()).unwrap();
+        old["version"] = 1.into();
+        assert_eq!(
+            RunMetadata::parse(&old.to_string()),
+            Err(EvidenceError::UnsupportedVersion(1))
+        );
+        assert!(EvidenceError::UnsupportedVersion(1)
+            .to_string()
+            .contains("regenerate with a current kit"));
     }
 
     #[test]
@@ -1245,6 +1667,7 @@ mod tests {
             " M src/tasks.rs",
             "M  src/tasks.rs",
             "?? note.txt\n M justfile",
+            "?? note.txt",
         ] {
             let error = accept_run(
                 &crew(),
@@ -1317,10 +1740,10 @@ mod tests {
     fn unsupported_schema_versions_cannot_pass() {
         let run = new_run_metadata("ship it", "/home/agent/workspace");
         let future = good_qc(&run.run_id, &run.goal_digest, &run.workspace, HEAD)
-            .replace("\"version\":1", "\"version\":2");
+            .replace("\"version\":2", "\"version\":1");
         assert_eq!(
             accept_run(&crew(), Some(&run.to_json()), Some(&future), HEAD, ""),
-            Err(EvidenceError::UnsupportedVersion(2))
+            Err(EvidenceError::UnsupportedVersion(1))
         );
     }
 
@@ -1447,12 +1870,12 @@ mod tests {
     }
 
     #[test]
-    fn the_report_must_come_from_the_configured_qc_role() {
+    fn reported_kinds_must_match_configured_workflow_roles() {
         let run = new_run_metadata("ship it", "/home/agent/workspace");
         let roles = crew();
         let base = good_qc(&run.run_id, &run.goal_digest, &run.workspace, HEAD);
 
-        // The implementer signing off under the QC field.
+        // A reported QC kind wired to the implementer assignment.
         let self_review = base.replace(
             &format!(r#""qc":"{}""#, roles.qc),
             &format!(r#""qc":"{}""#, roles.implementer),
@@ -1494,7 +1917,7 @@ mod tests {
         let run = new_run_metadata("update the handbook", "/home/agent/workspace");
         let roles = crew();
         let report = format!(
-            r#"{{"version":1,"run_id":"{}","goal_digest":"{}","workspace":"{}",
+            r#"{{"version":2,"base_commit":"{BASE}","scope":"change","round":1,"review":{{"started_commit":"{HEAD}","finished_commit":"{HEAD}"}},"run_id":"{}","goal_digest":"{}","workspace":"{}",
                "commit":"{HEAD}","verdict":"PASS","implementer":"{}","qc":"{}",
                "checks":[{{"name":"link-check","command":"lychee docs/","outcome":"passed","exit_code":0}},
                          {{"name":"spelling","command":"typos","outcome":"passed","exit_code":0}}]}}"#,

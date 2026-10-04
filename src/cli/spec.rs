@@ -351,6 +351,7 @@ fn task_command() -> Command {
                 .about("Deliver a goal to the task's sandboxed orchestrator")
                 .arg(required("slug", "SLUG"))
                 .arg(required("text", "TEXT"))
+                .arg(flag("report-only").help("Review an unchanged base commit without implementation commits"))
                 .arg(flag("no-watch").help("Return after delivery instead of watching progress")),
         )
         .subcommand(id_command(
@@ -1080,6 +1081,27 @@ fn path_arg(name: &'static str, value_name: &'static str) -> Arg {
 #[cfg(test)]
 mod tests {
     use clap::{Arg, Command};
+
+    #[test]
+    fn task_goal_accepts_report_only_with_or_without_watch() {
+        for flags in [
+            vec![],
+            vec!["--report-only"],
+            vec!["--report-only", "--no-watch"],
+        ] {
+            let mut args = vec!["task", "goal", "demo", "inspect the repository"];
+            args.extend(flags.iter().copied());
+            let matches = super::task_command()
+                .try_get_matches_from(args)
+                .expect("valid goal flags");
+            let goal = matches.subcommand_matches("goal").expect("goal command");
+            assert_eq!(
+                goal.get_flag("report-only"),
+                flags.contains(&"--report-only")
+            );
+            assert_eq!(goal.get_flag("no-watch"), flags.contains(&"--no-watch"));
+        }
+    }
 
     #[test]
     fn task_new_accepts_explicit_model_overrides() {

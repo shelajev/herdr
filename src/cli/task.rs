@@ -67,7 +67,7 @@ fn print_task_help() {
     eprintln!(
         "  herdr task new <slug> [--dir PATH] [--kit REF] [--mixin REF]... [--claude-model ID] [--codex-model ID] [--pi-provider ID] [--pi-model ID] [--roles orchestrator=K,planner=K,implementer=K,qc=K]"
     );
-    eprintln!("  herdr task goal <slug> <text> [--no-watch]");
+    eprintln!("  herdr task goal <slug> <text> [--no-watch] [--report-only]");
     eprintln!("  herdr task watch <slug>");
     eprintln!("  herdr task ls");
     eprintln!("  herdr task status <slug>");
@@ -263,11 +263,44 @@ fn accept_completed_run(
 
     let run_before = bail!(read_evidence_file(host, tasks::RUN_METADATA_FILE)?);
     let head_before = bail!(remote_git(host, workdir, &["rev-parse", "HEAD"])?);
+    let porcelain_before = bail!(remote_git(host, workdir, &["status", "--porcelain"])?);
     let qc = bail!(read_evidence_file(host, tasks::QC_EVIDENCE_FILE)?);
+    let Some(run_raw) = run_before.as_deref() else {
+        return Ok(Err(
+            tasks::EvidenceError::Missing(tasks::RUN_METADATA_FILE).to_string()
+        ));
+    };
+    let run = match tasks::RunMetadata::parse(run_raw) {
+        Ok(run) => run,
+        Err(err) => return Ok(Err(err.to_string())),
+    };
+    if !tasks::is_full_commit_id(&run.base_commit) || !tasks::is_full_commit_id(head_before.trim())
+    {
+        return Ok(Err("base_commit and HEAD must be full commit ids".into()));
+    }
+    // Keep ancestry inside the same read window as the report and HEAD.
+    // Non-ancestry and an unreadable Git graph both refuse acceptance.
+    if run.scope == tasks::RunScope::Change {
+        bail!(remote_git(
+            host,
+            workdir,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &run.base_commit,
+                head_before.trim()
+            ]
+        )?);
+    }
     let porcelain = bail!(remote_git(host, workdir, &["status", "--porcelain"])?);
     let head_after = bail!(remote_git(host, workdir, &["rev-parse", "HEAD"])?);
     let run_after = bail!(read_evidence_file(host, tasks::RUN_METADATA_FILE)?);
 
+    if porcelain_before != porcelain {
+        return Ok(Err(
+            "the workspace changed while QC evidence was being read".into(),
+        ));
+    }
     if head_before.trim() != head_after.trim() {
         return Ok(Err(format!(
             "the workspace moved from {} to {} while its QC evidence was being read; \
@@ -288,6 +321,7 @@ fn accept_completed_run(
         qc.as_deref(),
         head_before.trim(),
         &porcelain,
+        true,
     ) {
         Ok(evidence) => Ok(Ok(evidence)),
         Err(err) => Ok(Err(err.to_string())),
@@ -484,10 +518,12 @@ fn ensure_server(host: &str) -> std::io::Result<bool> {
 fn task_goal(args: &[String]) -> std::io::Result<i32> {
     // --no-watch may appear anywhere, including before the positionals.
     let mut watch = true;
+    let mut scope = tasks::RunScope::Change;
     let mut positionals = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--no-watch" => watch = false,
+            "--report-only" => scope = tasks::RunScope::ReportOnly,
             other if other.starts_with("--") => {
                 eprintln!("unknown option: {other}");
                 return Ok(2);
@@ -497,7 +533,7 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
     }
     let (Some(slug), Some(goal)) = (positionals.first().cloned(), positionals.get(1).cloned())
     else {
-        eprintln!("usage: herdr task goal <slug> <text> [--no-watch]");
+        eprintln!("usage: herdr task goal <slug> <text> [--no-watch] [--report-only]");
         return Ok(2);
     };
     if let Err(err) = validate_slug(&slug) {
@@ -537,12 +573,24 @@ fn task_goal(args: &[String]) -> std::io::Result<i32> {
         return Ok(1);
     }
 
-    // Mint this run's identity before the goal is delivered. The QC report must
+    // Mint this run's identity before every goal delivery. The QC report must
     // name this run id and this run's goal, so a report left behind by an
     // earlier run can never be mistaken for acceptance of this one. Discarding
     // any previous report is part of the same step: evidence describes one
     // reviewed commit of one run, and it is invalid the moment a new run opens.
-    let run = tasks::new_run_metadata(&goal, &workdir);
+    let base_commit = match remote_git(&host, &workdir, &["rev-parse", "HEAD"])? {
+        Ok(head) if tasks::is_full_commit_id(head.trim()) => head.trim().to_string(),
+        _ => {
+            eprintln!("cannot start a task goal: the workspace must have a readable commit (HEAD)");
+            return Ok(1);
+        }
+    };
+    match remote_git(&host, &workdir, &["status", "--porcelain"])? {
+        Ok(porcelain) if !porcelain.trim().is_empty() => eprintln!("warning: starting from a dirty workspace (including untracked files); QC requires a clean tree"),
+        Ok(_) => {},
+        Err(err) => { eprintln!("cannot read the starting worktree: {err}"); return Ok(1); }
+    }
+    let run = tasks::new_run_metadata(&goal, &workdir, &base_commit, scope);
     remove_crew_file(&host, tasks::QC_EVIDENCE_FILE)?;
     if let Err(err) = write_crew_file(&host, tasks::RUN_METADATA_FILE, &run.to_json())? {
         eprintln!("failed to record this run's identity: {err}");
@@ -711,9 +759,7 @@ fn watch_task(
                             "task {slug}: RESULT: DONE — accepted at {} (qc {}, implementer {})",
                             evidence.commit, evidence.qc, evidence.implementer
                         );
-                        for check in &evidence.checks {
-                            println!("  check | {} | {}", check.name, check.command);
-                        }
+                        println!("{}", tasks::format_qc_evidence(&evidence));
                         println!("review with: herdr task attach {slug}");
                         return Ok(0);
                     }
