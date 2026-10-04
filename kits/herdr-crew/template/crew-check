@@ -1,13 +1,61 @@
 #!/bin/bash
-# Verify the herdr-crew template tools are present. Used at image build time
-# and as the kit's fast install-step check at sandbox creation. Exits non-zero
-# with a clear message when the sandbox image is not the herdr-crew template.
+# Verify the herdr-crew template tools are present, runnable and on a supported
+# Node.js. Used at image build time and as the kit's fast install-step check at
+# sandbox creation. Exits non-zero with a clear message when the sandbox image
+# is not the herdr-crew template, a tool cannot report its version, or the Node
+# runtime is below what a pinned agent CLI requires. Nothing is silently
+# skipped or defaulted: a tool that fails or prints nothing is a failure.
 set -u
 
-export PATH="/home/agent/.local/bin:$PATH"
+# Directory holding the npm-installed agent CLIs. Overridable so the helper
+# tests can run against stub tools instead of the real ones.
+export PATH="${CREW_CHECK_BIN_DIR:-/home/agent/.local/bin}:$PATH"
+
+# Node.js floors: "<consumer> <major> <minor> <patch>", from the engines.node
+# field of the CLI versions pinned in template/Dockerfile (claude-code 2.1.289
+# >=22.0.0, pi 0.85.1 >=22.19.0, codex 0.153.4 >=16). Update with those pins.
+NODE_FLOORS=(
+  "claude 22 0 0"
+  "pi 22 19 0"
+  "codex 16 0 0"
+)
+
+problems=0
+problem() {
+  echo "herdr-crew: $*" >&2
+  problems=$((problems + 1))
+}
+
+errfile=$(mktemp) || { echo "herdr-crew: cannot create a temporary file" >&2; exit 1; }
+trap 'rm -f "$errfile"' EXIT
+
+# version_of <tool> <command...>
+# Runs the command and sets VERSION to the first line of its stdout. Returns
+# non-zero, after reporting why, when the command fails or prints nothing.
+VERSION=""
+version_of() {
+  local tool=$1 out status first
+  shift
+  VERSION=""
+  out=$("$@" 2>"$errfile")
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    problem "$tool: '$*' exited with status $status"
+    [ -s "$errfile" ] && cat "$errfile" >&2
+    return 1
+  fi
+  first=${out%%$'\n'*}
+  first=${first#"${first%%[![:space:]]*}"}
+  if [ -z "$first" ]; then
+    problem "$tool: '$*' reported an empty version"
+    [ -s "$errfile" ] && cat "$errfile" >&2
+    return 1
+  fi
+  VERSION=$first
+}
 
 missing=""
-for tool in herdr claude codex pi beans; do
+for tool in node herdr claude codex pi beans; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     missing="$missing $tool"
   fi
@@ -21,9 +69,46 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
+node_version=""
+if version_of node node --version; then
+  node_version=$VERSION
+  if [[ "$node_version" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+    for floor in "${NODE_FLOORS[@]}"; do
+      read -r consumer fmajor fminor fpatch <<<"$floor"
+      if [ "$major" -lt "$fmajor" ] ||
+        { [ "$major" -eq "$fmajor" ] && [ "$minor" -lt "$fminor" ]; } ||
+        { [ "$major" -eq "$fmajor" ] && [ "$minor" -eq "$fminor" ] && [ "$patch" -lt "$fpatch" ]; }; then
+        problem "node $node_version ($(command -v node)) is below the $consumer floor >=$fmajor.$fminor.$fpatch"
+      fi
+    done
+  else
+    problem "node: cannot parse version '$node_version'"
+  fi
+fi
+
+herdr_version=""
+claude_version=""
+codex_version=""
+pi_version=""
+beans_version=""
+version_of herdr herdr --version && herdr_version=$VERSION
+version_of claude claude --version && claude_version=$VERSION
+version_of codex codex --version && codex_version=$VERSION
+version_of pi pi --version && pi_version=$VERSION
+version_of beans beans version && beans_version=$VERSION
+
+if [ "$problems" -ne 0 ]; then
+  echo "herdr-crew: $problems check(s) failed; the sandbox image is not usable." >&2
+  echo "herdr-crew: rebuild it with scripts/sbx/build-crew-template.sh," >&2
+  echo "herdr-crew: then recreate the sandbox." >&2
+  exit 1
+fi
+
 echo "herdr-crew: tools present:"
-echo "  herdr  $(herdr --version 2>/dev/null | head -1)"
-echo "  claude $(claude --version 2>/dev/null | head -1)"
-echo "  codex  $(codex --version 2>/dev/null | head -1)"
-echo "  pi     $(pi --version 2>/dev/null | head -1)"
-echo "  beans  $(beans version 2>/dev/null | head -1)"
+echo "  node   $node_version"
+echo "  herdr  $herdr_version"
+echo "  claude $claude_version"
+echo "  codex  $codex_version"
+echo "  pi     $pi_version"
+echo "  beans  $beans_version"
