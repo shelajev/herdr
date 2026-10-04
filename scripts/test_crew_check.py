@@ -220,13 +220,15 @@ class CodexTrustSeedingTests(unittest.TestCase):
         self.workspace = self.root / "work" / "proj"
         self.workspace.mkdir(parents=True)
 
-    def seed(self, workspace, shell="/bin/sh"):
+    def seed(self, workspace, shell="/bin/sh", workdir=None, cwd=None):
         env = {"PATH": os.environ["PATH"]}
         if workspace is not None:
             env["WORKSPACE_DIR"] = str(workspace)
+        if workdir is not None:
+            env["WORKDIR"] = str(workdir)
         script = self.command.replace("/home/agent/.codex", str(self.codex))
         return subprocess.run(
-            [shell, "-c", script], env=env, capture_output=True, text=True, timeout=30
+            [shell, "-c", script], env=env, cwd=cwd, capture_output=True, text=True, timeout=30
         )
 
     def projects(self):
@@ -275,6 +277,79 @@ class CodexTrustSeedingTests(unittest.TestCase):
         link.symlink_to(self.workspace)
         self.assertEqual(self.seed(link).returncode, 0)
         self.assertEqual(list(self.projects()), [str(self.workspace)])
+
+    def other_workspace(self):
+        other = self.root / "work" / "other"
+        other.mkdir(parents=True, exist_ok=True)
+        return other
+
+    def test_workspace_dir_wins_when_both_are_set(self):
+        other = self.other_workspace()
+        result = self.seed(self.workspace, workdir=other)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(from WORKSPACE_DIR)", result.stdout)
+        # Only the chosen source is trusted, never both.
+        self.assertEqual(list(self.projects()), [str(self.workspace)])
+
+    def test_workdir_is_used_when_only_it_is_set(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                self.config.write_text(self.CONFIG)
+                result = self.seed(None, shell, workdir=self.workspace)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"seeding Codex trust for {self.workspace} (from WORKDIR)", result.stdout)
+                self.assertEqual(list(self.projects()), [str(self.workspace)])
+        self.config.write_text(self.CONFIG)
+        self.assertEqual(self.seed("", workdir=self.workspace).returncode, 0)
+        self.assertEqual(list(self.projects()), [str(self.workspace)])
+
+    def test_invalid_workspace_dir_falls_through_to_a_valid_workdir_and_says_so(self):
+        plain = self.root / "plain-file"
+        plain.write_text("")
+        invalid = {
+            "relative/dir": "not an absolute path",
+            "/": "filesystem root",
+            str(self.root / "does-not-exist"): "not a directory",
+            str(plain): "not a directory",
+            "/work/secret\nvalue": "control characters",
+        }
+        for workspace, reason in invalid.items():
+            with self.subTest(workspace=repr(workspace)):
+                self.config.write_text(self.CONFIG)
+                result = self.seed(workspace, workdir=self.workspace)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("(from WORKDIR)", result.stdout)
+                self.assertIn("skipped WORKSPACE_DIR", result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn("secret", result.stderr)
+                self.assertEqual(list(self.projects()), [str(self.workspace)])
+
+    def test_invalid_workdir_does_not_matter_when_workspace_dir_is_valid(self):
+        # WORKDIR is never consulted once WORKSPACE_DIR validates.
+        result = self.seed(self.workspace, workdir="/")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("(from WORKSPACE_DIR)", result.stdout)
+
+    def test_neither_candidate_set_fails_naming_both(self):
+        result = self.assertRefused(None, "no usable workspace", "WORKDIR is unset or empty")
+        self.assertIn("WORKSPACE_DIR is unset or empty", result.stderr)
+
+    def test_both_candidates_invalid_fails_naming_both_without_echoing_controls(self):
+        result = self.seed("/work/secret\nvalue", workdir="/")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("WORKSPACE_DIR contains control characters", result.stderr)
+        self.assertIn("WORKDIR resolves to the filesystem root", result.stderr)
+        self.assertNotIn("secret", result.stderr)
+        self.assertEqual(result.stderr.count("\n"), 1)
+        self.assertEqual(self.config.read_text(), self.CONFIG)
+
+    def test_the_cwd_is_never_a_workspace_source(self):
+        # kits-v2 install steps start in the template WORKDIR, which must not
+        # be mistaken for the project.
+        result = self.seed(None, cwd=self.workspace)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.config.read_text(), self.CONFIG)
 
     def test_unset_and_empty_workspace_fail(self):
         for workspace in (None, ""):

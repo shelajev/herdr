@@ -145,7 +145,12 @@ by running `herdr update`.
 3. Validate and publish the candidate kit under its own version tag. Test it with
    the new driver using `HERDR_TASK_KIT` set to that exact published reference.
    Model preflight, a change goal, a report-only goal, an override, a rejected model
-   and recovery after a resource grant must work before promotion.
+   and recovery after a resource grant must work before promotion. The same smoke
+   must confirm which variable carries the runtime workspace path during install
+   steps: the Codex trust step tries `WORKSPACE_DIR`, then `WORKDIR`, and fails
+   when neither is a usable directory, because the
+   [kits-v2 reference](https://docs.docker.com/ai/sandboxes/customize/kits-v2/)
+   says install commands start in the template WORKDIR, not the mounted project.
 4. Only after that pair passes, move `:latest` and install the new driver together,
    with no old tasks in flight. Retain the previous host artifact for rollback.
 

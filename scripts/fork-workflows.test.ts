@@ -311,7 +311,11 @@ describe("crew kit declaration", () => {
     );
     expect(step).toBeDefined();
     expect(step.user).toBe("agent");
+    // Ordered, validated candidates; never the step's own cwd (kits-v2 install
+    // commands start in the template WORKDIR).
     expect(step.command).toContain('raw="${WORKSPACE_DIR:-}"');
+    expect(step.command).toContain('raw="${WORKDIR:-}"');
+    expect(step.command).not.toContain("pwd");
     expect(step.command).toContain("readlink -f");
     // An unusable workspace must fail the install, not warn and succeed.
     expect(step.command).not.toContain("exit 0");
