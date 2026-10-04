@@ -60,8 +60,8 @@ template is rebuilt.
   (`files/home/crew/roles/`), records the role assignment and workspace path,
   declares proxy-managed credentials (real API keys never enter the VM) and
   the baseline network allowlist.
-- **Template image** (`template/Dockerfile`, published as
-  `docker.io/olegselajev241/herdr-crew:latest`, linux/arm64): herdr + Claude
+- **Template image** (`template/Dockerfile`, candidate default
+  `docker.io/olegselajev241/herdr-crew:0.5.0`, not published yet, linux/arm64): herdr + Claude
   Code + Codex + pi + beans baked in so sandbox creation is fast; `crew-entry`
   supervises the headless herdr server.
 - **Crew files** (`/home/agent/crew/` in the sandbox): `assignment`,
@@ -130,11 +130,13 @@ by running `herdr update`.
 1. Confirm the intended kit tag is unused. Keep 0.5.0 only if it has never been
    published; otherwise bump the kit version and its README version string before
    publication. Never overwrite `:0.4.5` or reuse a published version tag.
-2. Choose and record the template image digest. To move the observed inner runtime
-   from 0.9.0 to the Dockerfile's 0.9.3 pin, the host must rebuild and publish a
-   template, then point the kit's image at it. Likewise, changing installed CLI
-   versions requires a template rebuild. The successful model probes alone do
-   not require a CLI upgrade, and source edits do not alter a cached template.
+2. Build and publish the template as `docker.io/olegselajev241/herdr-crew:0.5.0`
+   and record its digest; this is the candidate kit's image default. The Dockerfile
+   keeps `HERDR_VERSION=0.9.3` and pins its CLI build defaults to
+   `CLAUDE_CODE_VERSION=2.1.289`, `CODEX_VERSION=0.153.4` and `PI_VERSION=0.85.1`,
+   the CLI versions tested in the development sandbox. Moving its observed inner
+   runtime from 0.9.0 to 0.9.3 requires this host-owned rebuild. Source edits do
+   not alter a cached template or publish the new image tag.
 3. Validate and publish the candidate kit under its own version tag. Test it with
    the new driver using `HERDR_TASK_KIT` set to that exact published reference.
    Model preflight, a change goal, a report-only goal, an override, a rejected model
@@ -404,6 +406,11 @@ when their commit is an ancestor of HEAD.
 | 24 | Agent already working without an owned phase | Investigate its work; do not add another prompt. |
 | 25 | Another phase owns the run | Finish or resolve that phase first. |
 | 26 | Evidence or native response cannot be verified | Inspect the named files/error and repair the evidence before recording. |
+
+For exit 23, restart the absent role with
+`python3 /home/agent/crew/bin/crew_models.py start --role <role> --kind <kind> --pane <pane-id>`.
+Use its kind from `/home/agent/crew/assignment` and its target pane ID from
+`herdr agent list`; the helper reads the configured model from the models file.
 
 The orchestrator normally runs these commands. An operator recovering manually
 must first attach and confirm it is not issuing the same work. Do not bypass the

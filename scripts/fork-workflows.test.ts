@@ -228,7 +228,7 @@ describe("crew kit declaration", () => {
     expect(spec.version).not.toBe("0.4.5");
   });
 
-  test("the inner Herdr is pinned for a reproducible template build", () => {
+  test("the inner Herdr and agent CLIs have pinned template build defaults", () => {
     // The template bakes an ordinary upstream release; `latest` would make two
     // builds of the same source produce different images.
     const dockerfile = readFileSync(
@@ -238,6 +238,9 @@ describe("crew kit declaration", () => {
     const pin = dockerfile.match(/^ARG HERDR_VERSION=(.+)$/m);
     expect(pin).not.toBeNull();
     expect(pin![1].trim()).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(dockerfile).toContain("ARG CLAUDE_CODE_VERSION=2.1.289\n");
+    expect(dockerfile).toContain("ARG CODEX_VERSION=0.153.4\n");
+    expect(dockerfile).toContain("ARG PI_VERSION=0.85.1\n");
   });
 
   test("ships a brief for every native crew role", () => {
@@ -278,6 +281,7 @@ describe("crew kit declaration", () => {
   test("boots from a published image and never builds one at creation", () => {
     expect(spec.sandbox.image).toBe("${{ kit.args.image }}");
     expect(spec.args.image.default).toMatch(/^docker\.io\//);
+    expect(spec.args.image.default).toBe("docker.io/olegselajev241/herdr-crew:0.5.0");
     expect(spec.sandbox.build).toBeUndefined();
   });
 

@@ -17,7 +17,7 @@ sourceURL: https://github.com/shelajev/herdr
 # must be prebuilt — see scripts/sbx/build-crew-template.sh.
 args:
   image:
-    default: docker.io/olegselajev241/herdr-crew:latest
+    default: docker.io/olegselajev241/herdr-crew:0.5.0
     description: Herdr crew template image (published, linux/arm64; for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh)
   roles:
     default: orchestrator=claude,planner=codex,implementer=claude,qc=pi
