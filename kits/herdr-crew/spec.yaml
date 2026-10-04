@@ -268,26 +268,29 @@ setup:
     # "Do you trust the contents of this directory?" dialog that nothing in an
     # unattended sandbox answers. Trust exactly the task workspace through the
     # per-project key Codex reads ([projects."<path>"] trust_level). This must
-    # run after the config step above, which rewrites config.toml. An empty,
-    # relative or "/" workspace is refused (never a blanket trust), and Codex
-    # then keeps asking, which is the safe outcome.
+    # run after the config step above, which rewrites config.toml. Codex keys
+    # trust by its canonical working directory, so WORKSPACE_DIR is resolved
+    # first (dot segments, symlinks) and that path is seeded. If no usable
+    # workspace can be established (unset, empty, relative, control characters,
+    # not a directory, or resolving to "/") the step fails instead of letting
+    # the sandbox install "successfully" with a Codex that would hang on the
+    # dialog or, worse, a blanket trust.
     - command: |
         set -e
-        ws="${WORKSPACE_DIR:-}"
-        while [ "${ws%/}" != "$ws" ]; do ws="${ws%/}"; done
-        case "$ws" in
+        fail() { echo "herdr-crew: $*; cannot seed Codex trust for the task workspace" >&2; exit 1; }
+        raw="${WORKSPACE_DIR:-}"
+        [ -n "$raw" ] || fail "WORKSPACE_DIR is unset or empty"
+        case "$raw" in
+          *[[:cntrl:]]*) fail "WORKSPACE_DIR contains control characters" ;;
           /*) ;;
-          *)
-            echo "herdr-crew: WORKSPACE_DIR is empty, relative or /; not seeding Codex trust" >&2
-            exit 0
-            ;;
+          *) fail "WORKSPACE_DIR is not an absolute path ('$raw')" ;;
         esac
+        ws=$(readlink -f -- "$raw") || fail "WORKSPACE_DIR ('$raw') cannot be resolved"
         case "$ws" in
-          *[[:cntrl:]]*)
-            echo "herdr-crew: WORKSPACE_DIR contains control characters; not seeding Codex trust" >&2
-            exit 0
-            ;;
+          "" | /) fail "WORKSPACE_DIR ('$raw') resolves to the filesystem root" ;;
+          *[[:cntrl:]]*) fail "WORKSPACE_DIR ('$raw') resolves to a path with control characters" ;;
         esac
+        [ -d "$ws" ] || fail "WORKSPACE_DIR ('$raw') is not a directory"
         esc=$(printf '%s' "$ws" | sed 's/\\/\\\\/g; s/"/\\"/g')
         header="[projects.\"$esc\"]"
         if ! grep -qxF "$header" /home/agent/.codex/config.toml; then

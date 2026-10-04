@@ -204,21 +204,26 @@ class CodexTrustSeedingTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.index, command, cls.user = install_step("Seed Codex trust for the task workspace only")
-        cls.command = command
+        cls.index, cls.command, cls.user = install_step(
+            "Seed Codex trust for the task workspace only"
+        )
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="crew-trust-test-")
         self.addCleanup(self.temp.cleanup)
-        self.codex = Path(self.temp.name) / "codex-home"
+        # The canonical form: the temp root itself may be a symlink (macOS).
+        self.root = Path(os.path.realpath(self.temp.name))
+        self.codex = self.root / "codex-home"
         self.codex.mkdir()
         self.config = self.codex / "config.toml"
         self.config.write_text(self.CONFIG)
+        self.workspace = self.root / "work" / "proj"
+        self.workspace.mkdir(parents=True)
 
     def seed(self, workspace, shell="/bin/sh"):
         env = {"PATH": os.environ["PATH"]}
         if workspace is not None:
-            env["WORKSPACE_DIR"] = workspace
+            env["WORKSPACE_DIR"] = str(workspace)
         script = self.command.replace("/home/agent/.codex", str(self.codex))
         return subprocess.run(
             [shell, "-c", script], env=env, capture_output=True, text=True, timeout=30
@@ -230,6 +235,16 @@ class CodexTrustSeedingTests(unittest.TestCase):
     def shells(self):
         return [shell for shell in ("/bin/sh", shutil.which("bash")) if shell]
 
+    def assertRefused(self, workspace, *fragments):
+        result = self.seed(workspace)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("WORKSPACE_DIR", result.stderr)
+        self.assertIn("cannot seed Codex trust", result.stderr)
+        for fragment in fragments:
+            self.assertIn(fragment, result.stderr)
+        self.assertEqual(self.config.read_text(), self.CONFIG)
+        return result
+
     def test_runs_as_agent_after_the_config_step_that_rewrites_the_file(self):
         self.assertEqual(self.user, "agent")
         config_index, _, _ = install_step("Seed Codex config/auth from SBX_CRED_OPENAI_MODE")
@@ -239,57 +254,96 @@ class CodexTrustSeedingTests(unittest.TestCase):
         for shell in self.shells():
             with self.subTest(shell=shell):
                 self.config.write_text(self.CONFIG)
-                result = self.seed("/Users/dev/proj", shell)
+                result = self.seed(self.workspace, shell)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
                     self.config.read_text(),
-                    self.CONFIG + '[projects."/Users/dev/proj"]\ntrust_level = "trusted"\n',
+                    self.CONFIG + f'[projects."{self.workspace}"]\ntrust_level = "trusted"\n',
                 )
-                self.assertEqual(
-                    self.projects(), {"/Users/dev/proj": {"trust_level": "trusted"}}
-                )
+                self.assertEqual(self.projects(), {str(self.workspace): {"trust_level": "trusted"}})
 
-    def test_trailing_slashes_are_normalized(self):
-        self.assertEqual(self.seed("/work/space//").returncode, 0)
-        self.assertEqual(list(self.projects()), ["/work/space"])
+    def test_trailing_slashes_and_dot_segments_seed_the_canonical_path(self):
+        (self.workspace / "sub").mkdir()
+        for spelling in (f"{self.workspace}//", f"{self.workspace}/sub/..", f"{self.workspace}/./"):
+            with self.subTest(spelling=spelling):
+                self.config.write_text(self.CONFIG)
+                self.assertEqual(self.seed(spelling).returncode, 0)
+                self.assertEqual(list(self.projects()), [str(self.workspace)])
 
-    def test_root_empty_unset_and_relative_workspaces_are_refused(self):
-        for workspace in ("/", "//", "", None, "relative/dir", "."):
+    def test_symlinked_workspace_seeds_the_resolved_directory_only(self):
+        link = self.root / "link"
+        link.symlink_to(self.workspace)
+        self.assertEqual(self.seed(link).returncode, 0)
+        self.assertEqual(list(self.projects()), [str(self.workspace)])
+
+    def test_unset_and_empty_workspace_fail(self):
+        for workspace in (None, ""):
             with self.subTest(workspace=workspace):
-                result = self.seed(workspace)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("not seeding Codex trust", result.stderr)
-                self.assertEqual(self.config.read_text(), self.CONFIG)
-                self.assertEqual(self.projects(), {})
+                self.assertRefused(workspace, "unset or empty")
 
-    def test_control_characters_are_refused(self):
-        for workspace in ("/work/a\nb", "/work/a\tb", "/work/a\rb"):
+    def test_root_and_aliases_of_root_fail(self):
+        link = self.root / "rootlink"
+        link.symlink_to("/")
+        for workspace in ("/", "//", "/.", "/..", "/./..", self.workspace / ".." / ".." / ".." / "..", link):
+            with self.subTest(workspace=str(workspace)):
+                self.assertRefused(workspace, "resolves to the filesystem root")
+
+    def test_relative_workspace_fails(self):
+        for workspace in ("relative/dir", ".", ".."):
+            with self.subTest(workspace=workspace):
+                self.assertRefused(workspace, "not an absolute path")
+
+    def test_missing_or_non_directory_workspace_fails(self):
+        plain = self.root / "plain-file"
+        plain.write_text("")
+        dangling = self.root / "dangling"
+        dangling.symlink_to(self.root / "does-not-exist")
+        for workspace in (self.root / "does-not-exist", self.root / "missing" / "deeper", plain, dangling):
+            with self.subTest(workspace=str(workspace)):
+                self.assertRefused(workspace)
+
+    def test_control_characters_fail_without_echoing_the_value(self):
+        for workspace in ("/work/secret\nvalue", "/work/secret\tvalue", "/work/secret\rvalue", "/work/secret\x1bvalue"):
             with self.subTest(workspace=repr(workspace)):
-                result = self.seed(workspace)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("control characters", result.stderr)
-                self.assertEqual(self.config.read_text(), self.CONFIG)
+                result = self.assertRefused(workspace, "control characters")
+                self.assertNotIn("secret", result.stderr)
+                self.assertNotRegex(result.stderr, r"[\x00-\x08\x0b-\x1f]")
+                self.assertEqual(result.stderr.count("\n"), 1)
+
+    def test_symlink_resolving_to_control_characters_fails_without_echoing_them(self):
+        target = self.root / "ctl\nname"
+        target.mkdir()
+        link = self.root / "ctl-link"
+        link.symlink_to(target)
+        result = self.assertRefused(link, "control characters")
+        self.assertEqual(result.stderr.count("\n"), 1)
 
     def test_quotes_backslashes_and_toml_syntax_in_the_path_are_escaped(self):
-        paths = [
-            '/work/we"ird\\dir',
-            "/work/trailing\\",
-            '/work/"][projects."/"]trust_level',
-            "/work/with space/[brackets]/it's",
-            "/work/ünïcode",
+        names = [
+            'we"ird\\dir',
+            "trailing\\",
+            '"][projects."',
+            "with space",
+            "[brackets]",
+            "it's",
+            "$(touch SHOULD_NOT_EXIST)",
+            "ünïcode",
         ]
-        for path in paths:
+        for name in names:
+            workspace = self.root / "odd" / name / "deeper"
+            workspace.mkdir(parents=True)
             for shell in self.shells():
-                with self.subTest(path=path, shell=shell):
+                with self.subTest(name=name, shell=shell):
                     self.config.write_text(self.CONFIG)
-                    result = self.seed(path, shell)
+                    result = self.seed(workspace, shell)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    # The file must still parse, and as exactly one project
-                    # whose key is the literal path.
-                    self.assertEqual(self.projects(), {path: {"trust_level": "trusted"}})
+                    # The file must still parse, as exactly one project whose
+                    # key is the literal path.
+                    self.assertEqual(self.projects(), {str(workspace): {"trust_level": "trusted"}})
+        self.assertFalse((Path.cwd() / "SHOULD_NOT_EXIST").exists())
 
     def test_never_writes_a_blanket_trust(self):
-        self.assertEqual(self.seed("/Users/dev/proj").returncode, 0)
+        self.assertEqual(self.seed(self.workspace).returncode, 0)
         projects = self.projects()
         self.assertEqual(len(projects), 1)
         self.assertNotIn("/", projects)
@@ -300,18 +354,18 @@ class CodexTrustSeedingTests(unittest.TestCase):
 
     def test_rerunning_does_not_duplicate_the_table(self):
         for _ in range(3):
-            self.assertEqual(self.seed("/Users/dev/proj").returncode, 0)
+            self.assertEqual(self.seed(self.workspace).returncode, 0)
         self.assertEqual(self.config.read_text().count("[projects."), 1)
-        self.assertEqual(list(self.projects()), ["/Users/dev/proj"])
+        self.assertEqual(list(self.projects()), [str(self.workspace)])
 
     def test_preserves_a_config_that_ends_with_a_table(self):
         self.config.write_text(
             self.CONFIG + '[model_providers.sandboxd]\nname = "Sandbox Proxy"\n'
         )
-        self.assertEqual(self.seed("/Users/dev/proj").returncode, 0)
+        self.assertEqual(self.seed(self.workspace).returncode, 0)
         parsed = tomllib.loads(self.config.read_text())
         self.assertEqual(parsed["model_providers"]["sandboxd"]["name"], "Sandbox Proxy")
-        self.assertEqual(parsed["projects"]["/Users/dev/proj"]["trust_level"], "trusted")
+        self.assertEqual(parsed["projects"][str(self.workspace)]["trust_level"], "trusted")
         self.assertEqual(parsed["approval_policy"], "never")
 
 
