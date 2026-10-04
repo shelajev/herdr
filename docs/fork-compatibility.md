@@ -92,12 +92,11 @@ instead of `latest`, so a template rebuild gets a known inner Herdr rather than
 whatever is newest that day. This is the *inner* Herdr — an ordinary upstream
 release, which does not need the fork's task commands.
 
-That pin fixes one input, not the image. The base image tag, the agent CLI
-versions installed from npm (`CLAUDE_CODE_VERSION`, `CODEX_VERSION`,
-`PI_VERSION` all still default to `latest`), and apt packages are all still
-mutable, so two builds of this Dockerfile on different days can differ. The
-template is not reproducible; it is merely no longer silently changing which
-Herdr it contains.
+The Dockerfile also pins the three npm CLI build defaults:
+`CLAUDE_CODE_VERSION=2.1.289`, `CODEX_VERSION=0.153.4` and `PI_VERSION=0.85.1`.
+These and `HERDR_VERSION=0.9.3` fix those version inputs. The base image tag and
+apt packages remain mutable, so builds on different days can still differ;
+these pins do not make the whole template reproducible.
 
 The pin takes effect only on a host-performed template rebuild and publication.
 Moving the observed sandbox runtime from 0.9.0 to 0.9.3 requires that rebuild and
