@@ -7,6 +7,13 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct ClientRemoteCollapsedGroups {
+    pub(super) profile_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) collapsed_groups: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct ClientChromePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -19,6 +26,8 @@ pub(super) struct ClientChromePreferences {
     pub(super) agent_panel_sort: Option<crate::config::AgentPanelSortConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) collapsed_groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) remote_collapsed_groups: Vec<ClientRemoteCollapsedGroups>,
 }
 
 pub(super) fn path_for_local_endpoint(socket_path: &Path) -> PathBuf {
@@ -54,7 +63,7 @@ pub(super) fn store(path: &Path, preferences: ClientChromePreferences) -> Result
     let temp_path = parent.join(temp_name);
     std::fs::write(&temp_path, content)
         .map_err(|error| format!("failed to write client shell state: {error}"))?;
-    crate::platform::replace_file(&temp_path, path).map_err(|error| {
+    std::fs::rename(&temp_path, path).map_err(|error| {
         let _ = std::fs::remove_file(&temp_path);
         format!("failed to replace client shell state: {error}")
     })
@@ -71,6 +80,16 @@ mod tests {
         let second = path_for_local_endpoint(Path::new("/run/herdr/two.sock"));
         assert_eq!(first, again);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn legacy_preferences_default_remote_collapses() {
+        let preferences: ClientChromePreferences =
+            serde_json::from_str(r#"{"collapsed_groups":["/repo"]}"#)
+                .expect("legacy client chrome preferences");
+
+        assert_eq!(preferences.collapsed_groups, ["/repo"]);
+        assert!(preferences.remote_collapsed_groups.is_empty());
     }
 
     #[test]

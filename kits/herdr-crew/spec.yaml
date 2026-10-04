@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: sandbox
 name: herdr-crew
-version: "0.4.1"
+version: "0.5.0"
 displayName: Herdr Crew
 description: |
   Task sandbox running a nested Herdr server and a crew of coding agents
@@ -17,11 +17,20 @@ sourceURL: https://github.com/shelajev/herdr
 # must be prebuilt — see scripts/sbx/build-crew-template.sh.
 args:
   image:
-    default: docker.io/olegselajev241/herdr-crew:latest
+    default: docker.io/olegselajev241/herdr-crew:0.5.0
     description: Herdr crew template image (published, linux/arm64; for local builds pass herdr-crew:local after scripts/sbx/build-crew-template.sh)
   roles:
     default: orchestrator=claude,planner=codex,implementer=claude,qc=pi
     description: Role assignment for this task; the host rotates this per task and guarantees qc differs from implementer
+  claude_model:
+    default: claude-opus-5-5
+    description: Model passed explicitly to Claude Code
+  codex_model:
+    default: gpt-6.1-sol
+    description: Model passed explicitly to Codex
+  pi_provider:
+    default: google
+    description: Provider paired with the pi model
   gemini_model:
     default: gemini-3.8-flash
     description: Google model the pi role pins with --provider google --model
@@ -139,6 +148,8 @@ permissions:
       - files.openai.com
       - codeload.github.com
       - generativelanguage.googleapis.com
+      # Official runtime docs and current agent detection manifests.
+      - herdr.dev
       # Source and packages for the actual task work.
       - github.com
       - api.github.com
@@ -156,6 +167,9 @@ environment:
   variables:
     IS_SANDBOX: "1"
     HERDR_CREW: "1"
+    HERDR_CREW_CLAUDE_MODEL: "${{ kit.args.claude_model }}"
+    HERDR_CREW_CODEX_MODEL: "${{ kit.args.codex_model }}"
+    HERDR_CREW_PI_PROVIDER: "${{ kit.args.pi_provider }}"
     HERDR_CREW_GEMINI_MODEL: "${{ kit.args.gemini_model }}"
     CODEX_HOME: /home/agent/.codex
     # git must never block on an interactive credential prompt in a headless
@@ -166,6 +180,9 @@ setup:
   install:
     # Fast: tools are baked into the template image; this only verifies them
     # and fails creation early with a clear message on a wrong image.
+    - command: command -v python3 >/dev/null
+      user: "1000"
+      description: Verify Python is available for crew model and phase helpers
     - command: crew-check
       user: "1000"
       description: Verify herdr and the crew agent CLIs are present
@@ -214,6 +231,7 @@ setup:
         approval_policy = "never"
         sandbox_mode = "danger-full-access"
         mcp_oauth_credentials_store = "file"
+        check_for_update_on_startup = false
         EOF
         case "$MODE" in
           oauth|apikey)
@@ -249,16 +267,18 @@ setup:
   startup:
     # The sandbox entrypoint (crew-entry) only runs when someone attaches, so
     # a detached task sandbox needs the herdr server started as a boot
-    # service. Startup commands run on every sandbox start; the pgrep guard
-    # keeps this idempotent.
+    # service. A real server request keeps repeated startup idempotent.
     - command:
         - sh
         - -c
-        - pgrep -f 'herdr server' >/dev/null 2>&1 || exec herdr server >>/tmp/herdr-server.log 2>&1
+        - export PATH="/home/agent/.local/bin:$PATH"; while true; do herdr agent list >/dev/null 2>&1 || herdr server >>/tmp/herdr-server.log 2>&1; sleep 5; done
       user: "agent"
       background: true
       description: Keep the headless herdr server running in detached sandboxes
   files:
+    - path: /home/agent/crew/models
+      content: "claude=${{ kit.args.claude_model }},codex=${{ kit.args.codex_model }},pi=${{ kit.args.pi_provider }}/${{ kit.args.gemini_model }}"
+      description: Authoritative model pins for all crew start paths
     - path: /home/agent/crew/assignment
       content: "${{ kit.args.roles }}"
       description: Role-to-agent assignment for this task

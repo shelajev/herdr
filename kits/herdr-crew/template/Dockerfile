@@ -10,10 +10,13 @@
 # https://docs.docker.com/ai/sandboxes/customize/kit-reference/#sandbox-block
 FROM docker/sandbox-templates:shell-docker
 
-ARG HERDR_VERSION=latest
-ARG CLAUDE_CODE_VERSION=latest
-ARG CODEX_VERSION=latest
-ARG PI_VERSION=latest
+# The inner Herdr is an ordinary upstream release and does not need the fork's
+# task commands. Pinned so a template rebuild is reproducible rather than
+# picking up whatever is newest; v0.9.3 is the verified upstream stable.
+ARG HERDR_VERSION=0.9.3
+ARG CLAUDE_CODE_VERSION=2.1.289
+ARG CODEX_VERSION=0.153.4
+ARG PI_VERSION=0.85.1
 
 USER root
 

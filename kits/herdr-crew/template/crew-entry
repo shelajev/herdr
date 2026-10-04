@@ -16,7 +16,7 @@ if [ -t 1 ]; then
 fi
 
 while true; do
-  if ! herdr status server >/dev/null 2>&1; then
+  if ! herdr agent list >/dev/null 2>&1; then
     herdr server >>/tmp/herdr-server.log 2>&1
     echo "herdr-crew: herdr server exited ($?), restarting in 5s" >>/tmp/herdr-server.log
   fi

@@ -698,8 +698,7 @@ fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String>
     Ok(())
 }
 
-#[cfg(windows)]
-const WINDOWS_INSTALLER: &str = include_str!("../distribution/install.ps1");
+pub(crate) const WINDOWS_INSTALLER: &str = include_str!("../distribution/install.ps1");
 
 #[cfg(windows)]
 struct DownloadedWindowsUpdate {
@@ -1782,26 +1781,23 @@ fn print_running_session_update_outcomes(
         return;
     }
 
+    let kept: Vec<KeptServer<'_>> = outcomes
+        .iter()
+        .filter(|outcome| outcome.outcome == RunningServerUpdateOutcome::CompatibleServerKept)
+        .map(|outcome| KeptServer {
+            label: &outcome.session_label,
+            version: version_label(outcome.server_version.as_deref()),
+            stop_command: &outcome.stop_command,
+            attach_command: outcome.attach_command.as_deref(),
+        })
+        .collect();
+    for line in kept_server_notice_lines(&kept, release.label()) {
+        eprintln!("{line}");
+    }
+
     for outcome in outcomes {
         match outcome.outcome {
-            RunningServerUpdateOutcome::CompatibleServerKept => {
-                eprintln!(
-                    "{} {} kept running server v{}.",
-                    outcome.target_noun,
-                    outcome.session_label,
-                    version_label(outcome.server_version.as_deref())
-                );
-                match &outcome.attach_command {
-                    Some(command) => eprintln!(
-                        "Run `{command}` to reconnect with the updated client. Restart the server later only if you need server-side changes from {}.",
-                        release.label()
-                    ),
-                    None => eprintln!(
-                        "Reconnect with the same socket override to use the updated client. Restart the server later only if you need server-side changes from {}.",
-                        release.label()
-                    ),
-                }
-            }
+            RunningServerUpdateOutcome::CompatibleServerKept => {}
             RunningServerUpdateOutcome::LiveHandoffComplete => {
                 if let Some(command) = &outcome.attach_command {
                     eprintln!(
@@ -1884,6 +1880,35 @@ fn print_running_session_update_outcomes(
 // ---------------------------------------------------------------------------
 // Installation manager detection
 // ---------------------------------------------------------------------------
+
+/// Whether this binary is the fork's host task driver.
+///
+/// `self_update` resolves `env::current_exe()` and renames a downloaded
+/// artifact over it. The manifest it downloads from `herdr.dev` describes
+/// *upstream* Herdr builds, which do not carry the `herdr task` crew commands
+/// this fork adds. Letting the updater run would therefore delete the host task
+/// driver and replace it with a binary that cannot drive a crew sandbox — and
+/// the failure would only surface later, as a missing subcommand.
+///
+/// The check is capability-based, not name-based: it asks whether this build
+/// has the task commands, so renaming or relocating the artifact does not
+/// bypass it. It says nothing about the *inner* Herdr running inside a crew
+/// sandbox, which is an ordinary upstream build and keeps its own updater.
+pub(crate) fn is_fork_task_driver() -> bool {
+    crate::cli::spec::has_task_commands()
+}
+
+/// Why the fork host task driver refuses to self-update, and what to do
+/// instead. Promotion is a deliberate host action against a reviewed commit,
+/// not a download.
+pub(crate) const FORK_TASK_DRIVER_UPDATE_REJECTION: &str =
+    "self-update is disabled for this build: it is the fork host task driver and carries the \
+     `herdr task` crew commands, which herdr.dev's upstream builds do not. Installing an \
+     upstream release over it would remove them. Promote a new host driver instead: build it \
+     from a fork commit that passed independent QC, record the artifact checksum, verify \
+     `herdr task` and the crew kit/evidence contracts against it, then install it deliberately \
+     and keep the previous artifact for rollback. The Herdr running inside a crew sandbox is a \
+     separate, ordinary upstream install and may be pinned to an upstream release.";
 
 pub(crate) fn update_install_command() -> &'static str {
     if is_homebrew_managed_install() {
@@ -2111,6 +2136,12 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    // Checked before the channel, the manifest, and any download: the refusal
+    // must not depend on reaching the network or on which channel is selected.
+    if is_fork_task_driver() {
+        return Err(FORK_TASK_DRIVER_UPDATE_REJECTION.to_string());
+    }
+
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2188,9 +2219,10 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         eprintln!("installed {}", release.label());
         print_outdated_integration_notice_with_updated_binary(&updated_exe);
         eprintln!(
-            "Start Herdr again to use the updated client. Running servers remain active; restart them later only if you need server-side changes from {}.",
+            "Open a new terminal, or reconnect SSH, then start Herdr again to use the updated client. Running servers remain active; restart them later only if you need server-side changes from {}.",
             release.label()
         );
+        print_saved_machine_update_notice();
     }
 
     #[cfg(not(windows))]
@@ -2225,9 +2257,115 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         print_outdated_integration_notice_with_updated_binary(&updated_exe);
 
         print_running_session_update_outcomes(&server_update_outcomes, &release);
+        print_saved_machine_update_notice();
     }
 
     Ok(release.version)
+}
+
+fn print_saved_machine_update_notice() {
+    let profiles = match crate::client::endpoint::EndpointCatalog::load_profiles() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            tracing::debug!(%error, "skipping saved machine update notice");
+            return;
+        }
+    };
+    for line in saved_machine_update_notice_lines(&profiles) {
+        eprintln!("{line}");
+    }
+}
+
+fn saved_machine_update_notice_lines(
+    profiles: &[crate::client::endpoint::SavedSshEndpoint],
+) -> Vec<String> {
+    let mut targets: Vec<&str> = Vec::new();
+    let mut labels: Vec<&str> = Vec::new();
+    for profile in profiles.iter().filter(|profile| profile.enabled) {
+        if !targets.contains(&profile.target.as_str()) {
+            targets.push(&profile.target);
+            labels.push(&profile.label);
+        }
+    }
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        "your SSH machines run their own herdr and may be older:".to_string(),
+    ];
+    lines.extend(labels.into_iter().map(|label| format!("  {label}")));
+    lines.push(
+        "run `herdr update` on each one. it will tell you what to restart there.".to_string(),
+    );
+    lines
+}
+
+#[cfg(not(windows))]
+struct KeptServer<'a> {
+    label: &'a str,
+    version: &'a str,
+    stop_command: &'a str,
+    attach_command: Option<&'a str>,
+}
+
+#[cfg(not(windows))]
+impl KeptServer<'_> {
+    fn reconnect(&self) -> String {
+        match self.attach_command {
+            Some(attach) => format!("`{attach}`"),
+            None => "herdr with the same socket override".to_string(),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn kept_server_notice_lines(kept: &[KeptServer<'_>], release_label: &str) -> Vec<String> {
+    match kept {
+        [] => Vec::new(),
+        [server] => vec![
+            String::new(),
+            format!(
+                "your running server is still v{}. run {} to reconnect; everything keeps working.",
+                server.version,
+                server.reconnect()
+            ),
+            format!("server fixes in v{release_label} apply only after it restarts."),
+            format!(
+                "when your agents are idle, run `{}`, then {}.",
+                server.stop_command,
+                server.reconnect()
+            ),
+            "this closes running panes and their agents.".to_string(),
+        ],
+        servers => {
+            let width = servers
+                .iter()
+                .map(|server| server.label.chars().count())
+                .max()
+                .unwrap_or(0);
+            let mut lines = vec![
+                String::new(),
+                "your running servers are still older. reconnect as usual; everything keeps working."
+                    .to_string(),
+                format!("server fixes in v{release_label} apply only after each one restarts:"),
+            ];
+            lines.extend(servers.iter().map(|server| {
+                format!(
+                    "  {:<width$}  v{}  `{}`, then {}",
+                    server.label,
+                    server.version,
+                    server.stop_command,
+                    server.reconnect()
+                )
+            }));
+            lines.push(
+                "restart one when its agents are idle. this closes its panes and their agents."
+                    .to_string(),
+            );
+            lines
+        }
+    }
 }
 
 fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
@@ -2243,6 +2381,16 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
 /// Background update check: only surface availability and release notes.
 /// Runs in a background thread at startup.
 pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
+    // The fork host task driver never offers an upstream replacement, so it
+    // never reaches a download or an UpdateReady handoff. Returning before the
+    // check is started keeps the background thread silent rather than
+    // repeatedly reporting a failure the operator cannot act on.
+    if is_fork_task_driver() {
+        tracing::debug!("skipping update check: fork host task driver");
+        let _ = &events;
+        return;
+    }
+
     crate::logging::update_check_started();
     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
         let version = version.trim();
@@ -2400,6 +2548,93 @@ fn platform_target() -> (&'static str, &'static str) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Fork host task driver update policy
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn this_build_is_recognized_as_the_fork_host_task_driver() {
+        // Identity comes from the compiled CLI surface, so the policy cannot be
+        // bypassed by renaming or relocating the artifact.
+        assert!(
+            is_fork_task_driver(),
+            "this source carries `herdr task`, so its builds must be treated as the fork driver"
+        );
+        assert!(crate::cli::spec::has_task_commands());
+    }
+
+    #[test]
+    fn manual_self_update_refuses_before_downloading_anything() {
+        // No manifest URL is reachable in a unit test; the point is that the
+        // refusal happens before the updater would try, on every channel.
+        for channel in ["stable", "preview"] {
+            let _ = channel;
+            let error = self_update(SelfUpdateOptions::default())
+                .expect_err("the fork host task driver must refuse to self-update");
+            assert_eq!(error, FORK_TASK_DRIVER_UPDATE_REJECTION);
+        }
+    }
+
+    #[test]
+    fn the_refusal_explains_promotion_instead_of_an_upstream_install() {
+        let rejection = FORK_TASK_DRIVER_UPDATE_REJECTION;
+        // It must not send the operator to the thing that breaks the driver.
+        assert!(!rejection.contains("herdr update"));
+        assert!(!rejection.contains("herdr-dev update"));
+        // It must name the actual promotion path and the rollback requirement.
+        assert!(rejection.contains("independent QC"));
+        assert!(rejection.contains("checksum"));
+        assert!(rejection.contains("rollback"));
+        // It must keep the inner sandbox Herdr explicitly out of scope.
+        assert!(rejection.contains("inside a crew sandbox"));
+    }
+
+    #[test]
+    fn automatic_update_never_hands_off_a_replacement() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        auto_update(tx);
+        // No UpdateReady event, so the TUI never offers an upstream install and
+        // no replacement handoff can start.
+        assert!(
+            rx.try_recv().is_err(),
+            "the fork host task driver must not emit an update offer"
+        );
+    }
+
+    #[test]
+    fn a_refused_update_leaves_the_running_artifact_untouched() {
+        // self_update is the only path that renames a download over
+        // env::current_exe(); if it returns before that, the executable on disk
+        // is byte-identical afterwards.
+        let exe = std::env::current_exe().expect("current exe");
+        let before = std::fs::read(&exe).expect("read current exe");
+        let error = self_update(SelfUpdateOptions::default()).expect_err("must refuse");
+        assert_eq!(error, FORK_TASK_DRIVER_UPDATE_REJECTION);
+        let after = std::fs::read(&exe).expect("read current exe");
+        assert!(
+            before == after,
+            "a refused update must not modify the running artifact"
+        );
+    }
+
+    #[test]
+    fn the_task_cli_contract_survives_a_refused_update() {
+        let _ = self_update(SelfUpdateOptions::default());
+        let subcommands = crate::cli::spec::task_subcommand_names();
+        assert!(
+            !subcommands.is_empty(),
+            "`herdr task` must still exist after a refused update"
+        );
+        for required in [
+            "new", "goal", "watch", "ls", "status", "attach", "policy", "rm",
+        ] {
+            assert!(
+                subcommands.iter().any(|name| name == required),
+                "`herdr task {required}` must survive a refused update, have {subcommands:?}"
+            );
+        }
+    }
     use std::os::unix::net::UnixListener;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -2407,6 +2642,103 @@ mod tests {
     };
     use std::sync::{Mutex, OnceLock};
     use std::thread;
+
+    fn saved_machine(
+        label: &str,
+        target: &str,
+        enabled: bool,
+    ) -> crate::client::endpoint::SavedSshEndpoint {
+        let mut profile =
+            crate::client::endpoint::SavedSshEndpoint::new(label, target, "default").unwrap();
+        profile.enabled = enabled;
+        profile
+    }
+
+    #[test]
+    fn saved_machine_notice_lists_enabled_machines_once_per_target() {
+        let profiles = [
+            saved_machine("rohan", "rohan", true),
+            saved_machine("rohan/agents", "rohan", true),
+            saved_machine("off", "offbox", false),
+            saved_machine("workbox", "dev@workbox", true),
+        ];
+
+        assert_eq!(
+            saved_machine_update_notice_lines(&profiles),
+            [
+                "",
+                "your SSH machines run their own herdr and may be older:",
+                "  rohan",
+                "  workbox",
+                "run `herdr update` on each one. it will tell you what to restart there.",
+            ]
+        );
+    }
+
+    #[test]
+    fn saved_machine_notice_is_empty_without_enabled_machines() {
+        assert!(saved_machine_update_notice_lines(&[]).is_empty());
+        assert!(
+            saved_machine_update_notice_lines(&[saved_machine("off", "offbox", false)]).is_empty()
+        );
+    }
+
+    #[test]
+    fn kept_server_notice_names_the_session_restart_commands() {
+        let default = KeptServer {
+            label: "default",
+            version: "0.9.1",
+            stop_command: "herdr server stop",
+            attach_command: Some("herdr"),
+        };
+        assert_eq!(
+            kept_server_notice_lines(&[default], "0.10.0"),
+            [
+                "",
+                "your running server is still v0.9.1. run `herdr` to reconnect; everything keeps working.",
+                "server fixes in v0.10.0 apply only after it restarts.",
+                "when your agents are idle, run `herdr server stop`, then `herdr`.",
+                "this closes running panes and their agents.",
+            ]
+        );
+
+        let work = KeptServer {
+            label: "work",
+            version: "0.9.0",
+            stop_command: "herdr session stop work",
+            attach_command: Some("herdr session attach work"),
+        };
+        let default = KeptServer {
+            label: "default",
+            version: "0.9.1",
+            stop_command: "herdr server stop",
+            attach_command: Some("herdr"),
+        };
+        assert_eq!(
+            kept_server_notice_lines(&[default, work], "0.10.0"),
+            [
+                "",
+                "your running servers are still older. reconnect as usual; everything keeps working.",
+                "server fixes in v0.10.0 apply only after each one restarts:",
+                "  default  v0.9.1  `herdr server stop`, then `herdr`",
+                "  work     v0.9.0  `herdr session stop work`, then `herdr session attach work`",
+                "restart one when its agents are idle. this closes its panes and their agents.",
+            ]
+        );
+        assert!(kept_server_notice_lines(&[], "0.10.0").is_empty());
+
+        let socket_override = KeptServer {
+            label: "/tmp/herdr.sock",
+            version: "0.9.1",
+            stop_command: "herdr server stop",
+            attach_command: None,
+        };
+        let lines = kept_server_notice_lines(&[socket_override], "0.10.0");
+        assert_eq!(
+            lines[3],
+            "when your agents are idle, run `herdr server stop`, then herdr with the same socket override."
+        );
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2852,6 +3184,9 @@ mod tests {
                 endpoint_protocol_generation: Some(
                     crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                 ),
+                surface_interest: true,
+                health_check: true,
+                ssh_agent_registration: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2924,6 +3259,9 @@ mod tests {
                     endpoint_protocol_generation: Some(
                         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                     ),
+                    surface_interest: true,
+                    health_check: true,
+                    ssh_agent_registration: false,
                 }),
             },
         };
@@ -3180,6 +3518,9 @@ mod tests {
                     endpoint_protocol_generation: Some(
                         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                     ),
+                    surface_interest: true,
+                    health_check: true,
+                    ssh_agent_registration: false,
                 }),
             },
         };

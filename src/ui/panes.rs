@@ -1,8 +1,8 @@
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Direction, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
@@ -13,7 +13,7 @@ use super::text::truncate_end;
 use super::widgets::panel_contrast_fg;
 use crate::app::state::Palette;
 use crate::app::AppState;
-use crate::layout::PaneInfo;
+use crate::layout::{PaneId, PaneInfo};
 use crate::popup_size::resolve_popup_geometry;
 use crate::terminal::{TerminalRuntime, TerminalRuntimeRegistry};
 
@@ -34,7 +34,11 @@ fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<Str
 // Full view computation reaches this helper for active and background panes.
 // Keep terminal queries narrow, allocation-free, and short under the core lock.
 fn terminal_inner_rect(rt: &TerminalRuntime, pane_inner: Rect, pane_scrollbars: bool) -> Rect {
-    if !pane_scrollbars || pane_inner.width <= 4 || rt.alternate_screen_active() {
+    terminal_inner_rect_for(pane_inner, pane_scrollbars && !rt.alternate_screen_active())
+}
+
+fn terminal_inner_rect_for(pane_inner: Rect, scrollbar_gutter: bool) -> Rect {
+    if !scrollbar_gutter || pane_inner.width <= 4 {
         return pane_inner;
     }
 
@@ -43,6 +47,108 @@ fn terminal_inner_rect(rt: &TerminalRuntime, pane_inner: Rect, pane_scrollbars: 
         pane_inner.y,
         pane_inner.width.saturating_sub(1),
         pane_inner.height,
+    )
+}
+
+fn zoomed_pane_borders(app: &AppState, multi_pane: bool) -> Borders {
+    if app.pane_borders.shows_borders(multi_pane) && app.pane_outer_borders {
+        Borders::ALL
+    } else {
+        Borders::NONE
+    }
+}
+
+/// Where a pane that is about to be created will sit in its tab.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NewPanePlacement {
+    /// The only pane of a new tab or workspace.
+    Alone,
+    /// The pane created by splitting `target` in workspace `ws_idx`.
+    Split {
+        ws_idx: usize,
+        target: PaneId,
+        direction: Direction,
+        ratio: f32,
+    },
+    /// A pane split off and immediately zoomed over its tab.
+    ZoomedOverlay,
+    /// An existing pane in workspace `ws_idx` getting a new terminal.
+    Existing { ws_idx: usize, pane: PaneId },
+}
+
+/// Terminal rows and columns a new pane gets once its tab is laid out in
+/// `area`, so its program starts at that size instead of being resized.
+pub(crate) fn new_pane_terminal_size(
+    app: &AppState,
+    area: Rect,
+    placement: NewPanePlacement,
+) -> (u16, u16) {
+    let laid_out = |panes: Vec<PaneInfo>, index: usize| {
+        let infos = apply_pane_chrome(
+            panes,
+            app.pane_borders,
+            app.pane_gaps,
+            app.pane_outer_borders,
+        );
+        pane_inner_rect(infos[index].rect, infos[index].borders)
+    };
+    // A lone pane has no neighbors, so its chrome matches a zoomed single pane.
+    let alone = || pane_inner_rect(area, zoomed_pane_borders(app, false));
+    let tab_for = |ws_idx: usize, pane: PaneId| {
+        let ws = app.workspaces.get(ws_idx)?;
+        ws.tabs.get(ws.find_tab_index_for_pane(pane)?)
+    };
+    let pane_inner = match placement {
+        NewPanePlacement::Alone => alone(),
+        NewPanePlacement::Existing { ws_idx, pane } => tab_for(ws_idx, pane)
+            .and_then(|tab| {
+                if tab.zoomed && tab.layout.focused() == pane {
+                    let multi_pane = tab.layout.pane_count() > 1;
+                    return Some(pane_inner_rect(area, zoomed_pane_borders(app, multi_pane)));
+                }
+                let panes = tab.layout.panes(area);
+                let index = panes.iter().position(|info| info.id == pane)?;
+                Some(laid_out(panes, index))
+            })
+            .unwrap_or_else(alone),
+        NewPanePlacement::ZoomedOverlay => pane_inner_rect(area, zoomed_pane_borders(app, true)),
+        NewPanePlacement::Split {
+            ws_idx,
+            target,
+            direction,
+            ratio,
+        } => tab_for(ws_idx, target)
+            .and_then(|tab| tab.layout.panes_after_split(area, target, direction, ratio))
+            .map(|(panes, new_index)| laid_out(panes, new_index))
+            .unwrap_or_else(alone),
+    };
+    new_terminal_size(app, pane_inner)
+}
+
+/// Terminal rows and columns for every pane of `layout` laid out in `area`, in
+/// pane order, so a multi-pane layout can start each program at its final size.
+pub(crate) fn new_layout_terminal_sizes(
+    app: &AppState,
+    area: Rect,
+    layout: &crate::layout::TileLayout,
+) -> Vec<(u16, u16)> {
+    apply_pane_chrome(
+        layout.panes(area),
+        app.pane_borders,
+        app.pane_gaps,
+        app.pane_outer_borders,
+    )
+    .into_iter()
+    .map(|info| new_terminal_size(app, pane_inner_rect(info.rect, info.borders)))
+    .collect()
+}
+
+fn new_terminal_size(app: &AppState, pane_inner: Rect) -> (u16, u16) {
+    // A new program starts on the primary screen, which reserves the gutter.
+    let inner = terminal_inner_rect_for(pane_inner, app.pane_scrollbars);
+    (
+        inner.height.max(crate::pane::MIN_PANE_ROWS),
+        inner.width.max(crate::pane::MIN_PANE_COLS),
     )
 }
 
@@ -91,11 +197,12 @@ fn shrink_for_one_cell_gap(size: u16) -> u16 {
 
 pub(crate) fn apply_pane_chrome(
     panes: Vec<PaneInfo>,
-    pane_borders: bool,
+    pane_borders: crate::config::PaneBordersConfig,
     pane_gaps: bool,
     pane_outer_borders: bool,
 ) -> Vec<PaneInfo> {
     let multi_pane = panes.len() > 1;
+    let bordered = pane_borders.shows_borders(multi_pane);
     let outer_left = panes.iter().map(|info| info.rect.x).min().unwrap_or(0);
     let outer_top = panes.iter().map(|info| info.rect.y).min().unwrap_or(0);
     let outer_right = panes
@@ -115,7 +222,7 @@ pub(crate) fn apply_pane_chrome(
             let right_neighbor = multi_pane.then(|| pane_to_right(&info, &panes)).flatten();
             let below_neighbor = multi_pane.then(|| pane_below(&info, &panes)).flatten();
 
-            if multi_pane && pane_gaps && !pane_borders {
+            if multi_pane && pane_gaps && !pane_borders.draws_borders() {
                 if right_neighbor.is_some() {
                     info.rect.width = shrink_for_one_cell_gap(info.rect.width);
                 }
@@ -124,7 +231,7 @@ pub(crate) fn apply_pane_chrome(
                 }
             }
 
-            info.borders = if !multi_pane || !pane_borders {
+            info.borders = if !bordered {
                 Borders::NONE
             } else {
                 let mut borders = Borders::ALL;
@@ -219,12 +326,7 @@ pub(super) fn resize_tab_panes(
         if let Some((terminal_id, rt)) =
             runtime_for_tab_pane(app, terminal_runtimes, workspace_index, tab, focused_id)
         {
-            let borders = if multi_pane && app.pane_borders && app.pane_outer_borders {
-                Borders::ALL
-            } else {
-                Borders::NONE
-            };
-            let pane_inner = pane_inner_rect(area, borders);
+            let pane_inner = pane_inner_rect(area, zoomed_pane_borders(app, multi_pane));
             let inner_rect = terminal_inner_rect(rt, pane_inner, app.pane_scrollbars);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
                 rt.resize(
@@ -284,11 +386,7 @@ pub(super) fn compute_pane_infos_for_tab(
 
     if tab.zoomed {
         let focused_id = tab.layout.focused();
-        let borders = if multi_pane && app.pane_borders && app.pane_outer_borders {
-            Borders::ALL
-        } else {
-            Borders::NONE
-        };
+        let borders = zoomed_pane_borders(app, multi_pane);
         let pane_inner = pane_inner_rect(area, borders);
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
@@ -391,9 +489,10 @@ pub(super) fn render_panes(
     pane_infos: &[PaneInfo],
     split_borders: &[crate::layout::SplitBorder],
 ) {
-    let Some(ws_idx) = target.map(|target| target.workspace_index) else {
+    let Some(target) = target else {
         return;
     };
+    let ws_idx = target.workspace_index;
     let Some(ws) = app.workspaces.get(ws_idx) else {
         return;
     };
@@ -405,6 +504,17 @@ pub(super) fn render_panes(
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
             rt.render(frame, info.inner_rect, show_cursor);
             render_pane_scrollbar(app, frame, info, rt);
+        } else if let Some(reason) = ws
+            .tabs
+            .get(target.tab_index)
+            .and_then(|tab| tab.terminal_id(info.id))
+            .and_then(|id| app.terminals.get(id))
+            .and_then(|terminal| terminal.restore_error.as_deref())
+        {
+            frame.render_widget(
+                Paragraph::new(reason).wrap(Wrap { trim: false }),
+                info.inner_rect,
+            );
         }
     }
 
@@ -457,7 +567,7 @@ fn render_pane_borders(
     split_borders: &[crate::layout::SplitBorder],
     frame: &mut Frame,
 ) {
-    if !app.pane_borders || pane_infos.iter().all(|info| info.borders.is_empty()) {
+    if !app.pane_borders.draws_borders() || pane_infos.iter().all(|info| info.borders.is_empty()) {
         return;
     }
 
@@ -728,8 +838,16 @@ fn automatic_selection_style(
 }
 
 fn automatic_selection_bg(p: &Palette, host_theme: crate::terminal_theme::TerminalTheme) -> Color {
-    let Some(background) = host_theme.background.map(terminal_theme_to_rgb) else {
-        return selection_palette_background(p);
+    let fallback = selection_palette_background(p);
+    let Some(background) = host_theme
+        .background
+        .map(|color| (color.r, color.g, color.b))
+        .or(match fallback {
+            Color::Rgb(r, g, b) => Some((r, g, b)),
+            _ => None,
+        })
+    else {
+        return fallback;
     };
 
     let target = if relative_luminance(background) < 0.5 {
@@ -749,11 +867,18 @@ fn selection_palette_background(p: &Palette) -> Color {
     }
 }
 
-fn terminal_theme_to_rgb(color: crate::terminal_theme::RgbColor) -> Rgb {
-    (color.r, color.g, color.b)
-}
-
 fn selection_fg_for_bg(bg: Color, p: &Palette) -> Color {
+    if let Color::Rgb(r, g, b) = bg {
+        let luminance = relative_luminance((r, g, b));
+        let black_contrast = (luminance + 0.05) / 0.05;
+        let white_contrast = 1.05 / (luminance + 0.05);
+        return if black_contrast > white_contrast {
+            Color::Rgb(0, 0, 0)
+        } else {
+            Color::Rgb(255, 255, 255)
+        };
+    }
+
     color_to_rgb(bg)
         .map(|bg| {
             if relative_luminance(bg) < 0.5 {
@@ -815,6 +940,7 @@ fn color_to_rgb(color: Color) -> Option<Rgb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PaneBordersConfig;
     use crate::layout::PaneId;
     use crate::selection::Selection;
     use crate::terminal::TerminalRuntime;
@@ -828,6 +954,36 @@ mod tests {
         frame: &mut Frame,
     ) {
         render_pane_borders(app, ws, &app.view.pane_infos, split_borders, frame);
+    }
+
+    #[test]
+    fn unavailable_pane_renders_restore_failure_without_a_runtime() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("unavailable")];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].terminal_id(pane_id).unwrap().clone();
+        app.terminals.get_mut(&terminal_id).unwrap().restore_error =
+            Some("Saved directory is unavailable. Restart to retry.".into());
+        let runtimes = TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = crate::ui::compute_tab_surface_for(
+            &app,
+            &runtimes,
+            Some(crate::ui::TabSurfaceTarget {
+                workspace_index: 0,
+                tab_index: 0,
+            }),
+            area,
+            false,
+            Default::default(),
+        );
+        let (buffer, cursor, _, _) =
+            crate::server::render_stream::render_tab_surface_virtual(&app, &runtimes, layout, area);
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Saved directory is unavailable."));
+        assert!(cursor.is_none_or(|cursor| !cursor.visible));
     }
 
     #[test]
@@ -901,7 +1057,7 @@ mod tests {
 
         let infos = apply_pane_chrome(
             workspace.tabs[0].layout.panes(Rect::new(0, 0, 100, 20)),
-            true,
+            PaneBordersConfig::Auto,
             false,
             true,
         );
@@ -922,7 +1078,7 @@ mod tests {
 
         let infos = apply_pane_chrome(
             workspace.tabs[0].layout.panes(Rect::new(0, 0, 100, 20)),
-            true,
+            PaneBordersConfig::Auto,
             false,
             true,
         );
@@ -943,7 +1099,7 @@ mod tests {
 
         let infos = apply_pane_chrome(
             workspace.tabs[0].layout.panes(Rect::new(0, 0, 100, 20)),
-            true,
+            PaneBordersConfig::Auto,
             false,
             false,
         );
@@ -963,7 +1119,7 @@ mod tests {
 
         let infos = apply_pane_chrome(
             workspace.tabs[0].layout.panes(Rect::new(0, 0, 100, 20)),
-            true,
+            PaneBordersConfig::Auto,
             true,
             true,
         );
@@ -984,7 +1140,7 @@ mod tests {
 
         let infos = apply_pane_chrome(
             workspace.tabs[0].layout.panes(Rect::new(0, 0, 100, 20)),
-            false,
+            PaneBordersConfig::Off,
             true,
             true,
         );
@@ -1004,7 +1160,7 @@ mod tests {
 
         let infos = apply_pane_chrome(
             workspace.tabs[0].layout.panes(Rect::new(0, 0, 100, 20)),
-            false,
+            PaneBordersConfig::Off,
             false,
             true,
         );
@@ -1013,6 +1169,36 @@ mod tests {
             assert!(info.borders.is_empty());
             assert_eq!(pane_inner_rect(info.rect, info.borders), info.rect);
         }
+    }
+
+    #[test]
+    fn always_pane_borders_frame_lone_pane() {
+        let workspace = Workspace::test_new("test");
+        let area = Rect::new(0, 0, 100, 20);
+
+        let default_infos = apply_pane_chrome(
+            workspace.tabs[0].layout.panes(area),
+            PaneBordersConfig::Auto,
+            false,
+            true,
+        );
+        assert_eq!(default_infos[0].borders, Borders::NONE);
+
+        let framed_infos = apply_pane_chrome(
+            workspace.tabs[0].layout.panes(area),
+            PaneBordersConfig::Always,
+            false,
+            true,
+        );
+        assert_eq!(framed_infos[0].borders, Borders::ALL);
+
+        let no_outer_infos = apply_pane_chrome(
+            workspace.tabs[0].layout.panes(area),
+            PaneBordersConfig::Always,
+            false,
+            false,
+        );
+        assert_eq!(no_outer_infos[0].borders, Borders::NONE);
     }
 
     #[test]
@@ -1415,5 +1601,52 @@ mod tests {
             panic!("selection background should resolve to rgb");
         };
         assert!(relative_luminance((r, g, b)) > relative_luminance((12, 14, 16)));
+    }
+
+    #[test]
+    fn automatic_selection_rgb_style_is_readable_with_or_without_host_background() {
+        for (background, selected_bg, selected_fg) in [
+            ((239, 241, 245), (172, 174, 176), (0, 0, 0)),
+            ((26, 27, 38), (90, 91, 99), (255, 255, 255)),
+            ((45, 53, 59), (104, 110, 114), (255, 255, 255)),
+        ] {
+            let mut palette = Palette::catppuccin();
+            let (r, g, b) = background;
+            palette.panel_bg = Color::Rgb(r, g, b);
+            let expected = Style::reset()
+                .bg(Color::Rgb(selected_bg.0, selected_bg.1, selected_bg.2))
+                .fg(Color::Rgb(selected_fg.0, selected_fg.1, selected_fg.2));
+
+            assert_eq!(
+                automatic_selection_style(&palette, Default::default()),
+                expected
+            );
+            assert_eq!(
+                automatic_selection_style(
+                    &Palette::terminal(),
+                    crate::terminal_theme::TerminalTheme {
+                        background: Some(crate::terminal_theme::RgbColor { r, g, b }),
+                        ..Default::default()
+                    },
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_selection_preserves_symbolic_palette_fallbacks() {
+        let mut palette = Palette::terminal();
+        assert_eq!(
+            automatic_selection_style(&palette, Default::default()),
+            Style::reset().fg(Color::White).bg(Color::DarkGray)
+        );
+        for fallback in [Color::Blue, Color::White, Color::Indexed(42), Color::Reset] {
+            palette.surface_dim = fallback;
+            assert_eq!(
+                automatic_selection_bg(&palette, Default::default()),
+                fallback
+            );
+        }
     }
 }

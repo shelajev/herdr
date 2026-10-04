@@ -2,6 +2,36 @@ use std::io::Write;
 
 use clap::{Arg, ArgAction, ArgGroup, Command, ValueHint};
 
+mod completion;
+mod machine;
+
+/// Whether this build carries the fork's `herdr task` crew commands.
+///
+/// Update policy keys off this rather than the binary's filename or install
+/// path: a fork artifact that someone renames, copies, or installs elsewhere is
+/// still the host task driver, and replacing it with an upstream build would
+/// silently remove every `herdr task` subcommand.
+/// The fork's `herdr task` subcommand names, as this build actually parses
+/// them. Used to assert the task CLI contract survives update policy changes.
+#[cfg(test)]
+pub(crate) fn task_subcommand_names() -> Vec<String> {
+    command()
+        .get_subcommands()
+        .find(|subcommand| subcommand.get_name() == "task")
+        .map(|task| {
+            task.get_subcommands()
+                .map(|subcommand| subcommand.get_name().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn has_task_commands() -> bool {
+    command()
+        .get_subcommands()
+        .any(|subcommand| subcommand.get_name() == "task")
+}
+
 pub(super) fn command() -> Command {
     let command = Command::new("herdr")
         .about("terminal workspace manager for AI coding agents")
@@ -9,6 +39,7 @@ pub(super) fn command() -> Command {
         .disable_version_flag(true)
         .arg(help_flag())
         .arg(option("session", "NAME").help("Use or create a named persistent session"))
+        .arg(option("machine", "LABEL-OR-ID").help("Run an API command on a saved SSH machine"))
         .arg(option("remote", "TARGET").help("Attach through SSH to a remote Herdr server"))
         .arg(
             option("remote-keybindings", "MODE")
@@ -25,11 +56,12 @@ pub(super) fn command() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Print version and exit"),
         )
-        .subcommand(completion_command())
+        .subcommand(completion::command())
         .subcommand(update_command())
         .subcommand(status_command())
         .subcommand(config_command())
         .subcommand(channel_command())
+        .subcommand(machine::command())
         .subcommand(server_command())
         .subcommand(api_command())
         .subcommand(workspace_command())
@@ -107,19 +139,6 @@ fn write_requested_help(
     selected.write_long_help(&mut *output)?;
     writeln!(output)?;
     Ok(true)
-}
-
-fn completion_command() -> Command {
-    Command::new("completion")
-        .visible_alias("completions")
-        .about("Generate shell completion scripts")
-        .arg(
-            Arg::new("shell")
-                .value_name("SHELL")
-                .required(true)
-                .value_parser(super::completion::SUPPORTED_SHELLS)
-                .help("Shell to generate completions for"),
-        )
 }
 
 fn update_command() -> Command {
@@ -319,6 +338,10 @@ fn task_command() -> Command {
                         .action(ArgAction::Append)
                         .help("Extra sbx mixin kit to stack onto the sandbox (repeatable)"),
                 )
+                .arg(option("claude-model", "ID").help("Claude model (env: HERDR_TASK_CLAUDE_MODEL)"))
+                .arg(option("codex-model", "ID").help("Codex model (env: HERDR_TASK_CODEX_MODEL)"))
+                .arg(option("pi-provider", "ID").help("pi provider (env: HERDR_TASK_PI_PROVIDER)"))
+                .arg(option("pi-model", "ID").help("pi model (env: HERDR_TASK_PI_MODEL)"))
                 .arg(option("roles", "SPEC").help(
                     "orchestrator=KIND,planner=KIND,implementer=KIND,qc=KIND (qc must differ from implementer)",
                 )),
@@ -328,6 +351,7 @@ fn task_command() -> Command {
                 .about("Deliver a goal to the task's sandboxed orchestrator")
                 .arg(required("slug", "SLUG"))
                 .arg(required("text", "TEXT"))
+                .arg(flag("report-only").help("Review an unchanged base commit without implementation commits"))
                 .arg(flag("no-watch").help("Return after delivery instead of watching progress")),
         )
         .subcommand(id_command(
@@ -701,6 +725,7 @@ fn report_agent_command() -> Command {
         .arg(option("seq", "N"))
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
+        .arg(resume_argv_arg())
 }
 
 fn report_agent_session_command() -> Command {
@@ -713,6 +738,15 @@ fn report_agent_session_command() -> Command {
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
         .arg(option("session-start-source", "SOURCE"))
+        .arg(resume_argv_arg())
+}
+
+fn resume_argv_arg() -> Arg {
+    Arg::new("resume_argv")
+        .value_name("RESUME_ARG")
+        .num_args(0..)
+        .last(true)
+        .help("Command that resumes this session after a Herdr restart; starts with a plain command name")
 }
 
 fn release_agent_command() -> Command {
@@ -950,10 +984,12 @@ fn integration_target_arg() -> Arg {
 }
 
 fn integration_target_values() -> Vec<&'static str> {
-    crate::api::schema::IntegrationTarget::ALL
+    let mut values: Vec<&'static str> = crate::api::schema::IntegrationTarget::ALL
         .into_iter()
         .map(crate::integration::integration_target_label)
-        .collect()
+        .collect();
+    values.extend_from_slice(crate::integration::EXPERIMENTAL_INTEGRATION_TARGET_LABELS);
+    values
 }
 
 fn id_command(name: &'static str, id: &'static str, about: &'static str) -> Command {
@@ -1045,6 +1081,58 @@ fn path_arg(name: &'static str, value_name: &'static str) -> Arg {
 #[cfg(test)]
 mod tests {
     use clap::{Arg, Command};
+
+    #[test]
+    fn task_goal_accepts_report_only_with_or_without_watch() {
+        for flags in [
+            vec![],
+            vec!["--report-only"],
+            vec!["--report-only", "--no-watch"],
+        ] {
+            let mut args = vec!["task", "goal", "demo", "inspect the repository"];
+            args.extend(flags.iter().copied());
+            let matches = super::task_command()
+                .try_get_matches_from(args)
+                .expect("valid goal flags");
+            let goal = matches.subcommand_matches("goal").expect("goal command");
+            assert_eq!(
+                goal.get_flag("report-only"),
+                flags.contains(&"--report-only")
+            );
+            assert_eq!(goal.get_flag("no-watch"), flags.contains(&"--no-watch"));
+        }
+    }
+
+    #[test]
+    fn task_new_accepts_explicit_model_overrides() {
+        let matches = super::task_command()
+            .try_get_matches_from([
+                "task",
+                "new",
+                "demo",
+                "--claude-model",
+                "claude-test",
+                "--codex-model",
+                "codex-test",
+                "--pi-provider",
+                "provider-test",
+                "--pi-model",
+                "pi-test",
+            ])
+            .expect("valid task model flags");
+        let new = matches.subcommand_matches("new").expect("new command");
+        for (flag, expected) in [
+            ("claude-model", "claude-test"),
+            ("codex-model", "codex-test"),
+            ("pi-provider", "provider-test"),
+            ("pi-model", "pi-test"),
+        ] {
+            assert_eq!(
+                new.get_one::<String>(flag).map(String::as_str),
+                Some(expected)
+            );
+        }
+    }
 
     fn command_path<'a>(cmd: &'a Command, path: &[&str]) -> &'a Command {
         let mut current = cmd;
@@ -1176,6 +1264,15 @@ mod tests {
     fn spec_matches_all_integration_targets() {
         let cmd = super::command();
         let install = command_path(&cmd, &["integration", "install"]);
+        let mut expected: Vec<String> = crate::api::schema::IntegrationTarget::ALL
+            .map(crate::integration::integration_target_label)
+            .map(str::to_string)
+            .to_vec();
+        expected.extend(
+            crate::integration::EXPERIMENTAL_INTEGRATION_TARGET_LABELS
+                .iter()
+                .map(|label| (*label).to_string()),
+        );
         assert_eq!(
             argument(install, "target")
                 .get_value_parser()
@@ -1183,9 +1280,7 @@ mod tests {
                 .unwrap()
                 .map(|value| value.get_name().to_string())
                 .collect::<Vec<_>>(),
-            crate::api::schema::IntegrationTarget::ALL
-                .map(crate::integration::integration_target_label)
-                .map(str::to_string)
+            expected
         );
     }
 

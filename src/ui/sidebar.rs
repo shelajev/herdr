@@ -129,6 +129,7 @@ pub(crate) fn resolved_token_spans(
         .iter()
         .map(|token| match &token.kind {
             ResolvedTokenKind::StateText(text)
+            | ResolvedTokenKind::Machine(text)
             | ResolvedTokenKind::Workspace(text)
             | ResolvedTokenKind::Tab(text)
             | ResolvedTokenKind::Pane(text)
@@ -218,9 +219,7 @@ pub(crate) fn resolved_token_spans(
             let previous = &resolved[visible_indices[position - 1]];
             spans.push(Span::styled(
                 tokens::separator(previous, token),
-                Style::default()
-                    .fg(palette.overlay0)
-                    .add_modifier(Modifier::DIM),
+                Style::default().fg(palette.overlay0),
             ));
         }
         match &token.kind {
@@ -236,7 +235,8 @@ pub(crate) fn resolved_token_spans(
                 truncate_end(text, budgets[index]),
                 apply_token_style(workspace_style, token.style),
             )),
-            ResolvedTokenKind::Tab(text)
+            ResolvedTokenKind::Machine(text)
+            | ResolvedTokenKind::Tab(text)
             | ResolvedTokenKind::Pane(text)
             | ResolvedTokenKind::Agent(text)
             | ResolvedTokenKind::Branch(text) => spans.push(Span::styled(

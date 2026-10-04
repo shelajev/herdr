@@ -9,6 +9,8 @@ __pycache__/
 .DS_Store
 
 /docs/*
+# Fork-only: the compatibility inventory is source, not generated docs.
+!/docs/fork-compatibility.md
 !/docs/next/
 !/docs/next/**
 !/docs/preview/

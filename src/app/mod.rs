@@ -9,13 +9,14 @@ pub(crate) mod agent_view;
 mod agents;
 pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
+#[cfg(test)]
+pub(crate) use api::test_support::exiting_test_command;
 mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
 mod custom_commands;
 mod git_refresh;
 mod ids;
-pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
 mod session;
@@ -101,9 +102,6 @@ impl AppPolicy {
 
 pub struct App {
     pub state: AppState,
-    pub(crate) pane_graphics: pane_graphics::Runtime,
-    pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
-    pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
@@ -122,6 +120,7 @@ pub struct App {
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
+    pub(crate) worktree_read_slots: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_worktree_remove_runtime_exits: HashMap<crate::layout::PaneId, usize>,
@@ -134,8 +133,12 @@ pub struct App {
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    startup_per_agent_delay: Duration,
+    next_agent_resume_at: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
+    pane_exit_checkpoint_pending: bool,
     pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
     tab_bar_datetimes: Vec<tab_bar_status::TabBarDatetimeRuntime>,
@@ -358,8 +361,8 @@ impl App {
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
     ) -> Self {
-        let (prefix_code, prefix_mods) = config.prefix_key();
-        crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+        let prefix_keys = config.prefix_keys();
+        crate::kitty_graphics::set_enabled(config.kitty_graphics_enabled());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
@@ -367,9 +370,11 @@ impl App {
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-        let (workspaces, active, selected) = if !policy.restore_session {
-            (Vec::new(), None, 0)
-        } else if let Some(snap) = crate::persist::load() {
+        let snapshot = policy.restore_session.then(crate::persist::load).flatten();
+        let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
+            policy.restore_session && snapshot.is_none(),
+        )));
+        let (workspaces, active, selected) = if let Some(snap) = snapshot {
             let history = config
                 .experimental
                 .pane_history
@@ -474,8 +479,7 @@ impl App {
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
             outer_terminal_focus: None,
-            prefix_code,
-            prefix_mods,
+            prefix_keys,
             headless_size: config.headless_size(),
             agent_panel_sort,
             agent_view_override: None,
@@ -494,7 +498,7 @@ impl App {
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
-            kitty_graphics_enabled: config.experimental.kitty_graphics,
+            kitty_graphics_enabled: config.kitty_graphics_enabled(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -566,9 +570,6 @@ impl App {
             toast_deadline: None,
             last_api_notification_at: None,
             state,
-            pane_graphics: pane_graphics::Runtime::default(),
-            pane_graphics_files: Arc::new(crate::pane_graphics_files::FileStore::default()),
-            direct_graphics_available: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
@@ -580,6 +581,7 @@ impl App {
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
             pending_api_worktree_creates: HashMap::new(),
+            worktree_read_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),
             pending_worktree_remove_runtime_exits: HashMap::new(),
@@ -594,8 +596,14 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
+            startup_per_agent_delay: Duration::from_millis(
+                config.session.startup_per_agent_delay_ms.into(),
+            ),
+            next_agent_resume_at: None,
             session_save_deadline: None,
             session_save_thread: None,
+            session_writer,
+            pane_exit_checkpoint_pending: false,
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
             tab_bar_datetimes: Vec::new(),
@@ -693,9 +701,17 @@ impl App {
         }
 
         let cwd = self.resolve_new_terminal_cwd(None);
+        let preserve_checkpoint = self.pane_exit_checkpoint_pending && !self.state.session_dirty;
 
         match self.create_workspace_with_options(cwd, true) {
-            Ok(_) => true,
+            Ok(_) => {
+                if preserve_checkpoint {
+                    // Automatic replacement is part of pane removal, not a new user mutation.
+                    self.pane_exit_checkpoint_pending = true;
+                    self.finish_checkpointed_pane_exit();
+                }
+                true
+            }
             Err(err) => {
                 tracing::error!(err = %err, "failed to create default workspace");
                 self.state.mode = Mode::Navigate;
@@ -782,8 +798,7 @@ impl App {
         if !invalid_section("keys") {
             match config.live_keybinds_with_diagnostics() {
                 Ok((live, keybind_diagnostics)) => {
-                    self.state.prefix_code = live.prefix.0;
-                    self.state.prefix_mods = live.prefix.1;
+                    self.state.prefix_keys = live.prefix;
                     self.state.keybinds = live.keybinds;
                     match config.local_keybindings_profile_toml() {
                         Ok(profile) => self.client_shell_keybindings_profile = Some(profile),
@@ -841,14 +856,28 @@ impl App {
             }
         }
 
+        if !invalid_section("session")
+            && Duration::from_millis(config.session.startup_per_agent_delay_ms.into())
+                != self.startup_per_agent_delay
+        {
+            diagnostics.push(
+                "session.startup_per_agent_delay_ms changes require restarting Herdr; kept current setting"
+                    .into(),
+            );
+        }
+
+        let graphics_config_valid = !invalid_section("terminal")
+            && (config.terminal.kitty_graphics.is_some() || !invalid_section("experimental"));
+        if graphics_config_valid
+            && config.kitty_graphics_enabled() != self.state.kitty_graphics_enabled
+        {
+            diagnostics.push(
+                "terminal.kitty_graphics changes require restarting Herdr; kept current setting"
+                    .into(),
+            );
+        }
+
         if !invalid_section("experimental") {
-            let was_kitty_graphics_enabled = self.state.kitty_graphics_enabled;
-            self.state.kitty_graphics_enabled = config.experimental.kitty_graphics;
-            crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
-            if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
-                self.pane_graphics.clear();
-                self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
-            }
             self.state.reveal_hidden_cursor_for_cjk_ime =
                 config.experimental.reveal_hidden_cursor_for_cjk_ime;
             self.state.cjk_ime_agent_filter_configured =
@@ -971,13 +1000,15 @@ mod tests {
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(
+        let mut app = App::new(
             &Config::default(),
             crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
-        )
+        );
+        app.state.default_shell = exiting_test_command().into();
+        app
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
@@ -986,16 +1017,6 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("herdr-{name}-{}-{stamp}", std::process::id()))
-    }
-
-    #[cfg(windows)]
-    fn exiting_test_command() -> &'static str {
-        "C:\\Windows\\System32\\whoami.exe"
-    }
-
-    #[cfg(not(windows))]
-    fn exiting_test_command() -> &'static str {
-        "/usr/bin/true"
     }
 
     fn config_env_lock() -> &'static Mutex<()> {
@@ -1683,8 +1704,10 @@ mod tests {
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(app.state.headless_size, (160, 50));
-        assert_eq!(app.state.prefix_code, KeyCode::Char('a'));
-        assert_eq!(app.state.prefix_mods, KeyModifiers::CONTROL);
+        assert_eq!(
+            app.state.prefix_keys,
+            vec![(KeyCode::Char('a'), KeyModifiers::CONTROL)]
+        );
         assert!(app
             .state
             .keybinds
@@ -1722,6 +1745,53 @@ mod tests {
     }
 
     #[test]
+    fn reload_config_keeps_kitty_graphics_until_restart() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-kitty-graphics");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[terminal]\nkitty_graphics = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(app.state.kitty_graphics_enabled);
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(app.state.kitty_graphics_enabled);
+        assert_eq!(
+            report.diagnostics,
+            vec![
+                "terminal.kitty_graphics changes require restarting Herdr; kept current setting"
+                    .to_owned()
+            ]
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_reports_startup_delay_requires_restart() {
+        let mut app = test_app();
+        let mut config = Config::default();
+        let report = app.apply_live_config(&config, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+
+        config.session.startup_per_agent_delay_ms = 250;
+        let report = app.apply_live_config(&config, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(app.startup_per_agent_delay, Duration::from_millis(100));
+        assert_eq!(report.diagnostics, vec![
+            "session.startup_per_agent_delay_ms changes require restarting Herdr; kept current setting"
+        ]);
+
+        let report = app.apply_live_config(&config, &[], &["session".into()], false);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(app.startup_per_agent_delay, Duration::from_millis(100));
+    }
+
+    #[test]
     fn reload_config_requests_client_reload_for_key_only_change() {
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("reload-config-key-only");
@@ -1734,7 +1804,10 @@ mod tests {
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.prefix_code, KeyCode::Char('a'));
+        assert_eq!(
+            app.state.prefix_keys,
+            vec![(KeyCode::Char('a'), KeyModifiers::CONTROL)]
+        );
         assert!(app.state.request_client_config_reload);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -1804,6 +1877,27 @@ mod tests {
         );
         assert_eq!(app.state.sidebar_spaces.row_gap, 3);
 
+        let conditional = "[ui.sidebar.agents]\nrows = [[{ token = '$load', rules = [{ gt = 80, bold = true }] }]]\n";
+        std::fs::write(&path, conditional).unwrap();
+        assert_eq!(
+            app.reload_config().status,
+            crate::config::ConfigReloadStatus::Applied
+        );
+        assert_eq!(
+            app.state.sidebar_agents.rows[0][0]
+                .style_for_value("90")
+                .unwrap()
+                .bold,
+            Some(true)
+        );
+        let previous = app.state.sidebar_agents.clone();
+        std::fs::write(&path, conditional.replace("gt = 80", "gt = 'invalid'")).unwrap();
+        assert_eq!(
+            app.reload_config().status,
+            crate::config::ConfigReloadStatus::Partial
+        );
+        assert_eq!(app.state.sidebar_agents, previous);
+
         let previous_agents = app.state.sidebar_agents.clone();
         std::fs::write(
             &path,
@@ -1829,13 +1923,9 @@ mod tests {
         let original_pane_borders = app.state.pane_borders;
         // Pair the bad bounds with another `[ui]` field change to confirm the
         // entire section is treated as invalid (not just the bounds).
-        let target_pane_borders = !original_pane_borders;
         std::fs::write(
             &path,
-            format!(
-                "[ui]\nsidebar_min_width = 50\nsidebar_max_width = 30\npane_borders = {}\n",
-                target_pane_borders
-            ),
+            "[ui]\nsidebar_min_width = 50\nsidebar_max_width = 30\npane_borders = \"always\"\n",
         )
         .unwrap();
 
@@ -1872,17 +1962,14 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
+        let original_prefix = app.state.prefix_keys.clone();
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("keys.new_workspace") && diagnostic.contains("disabling binding")
         }));
-        assert_eq!(
-            (app.state.prefix_code, app.state.prefix_mods),
-            original_prefix
-        );
+        assert_eq!(app.state.prefix_keys, original_prefix);
         assert!(app.state.keybinds.new_workspace.bindings.is_empty());
         assert_eq!(
             app.state.toast_config.delivery,
@@ -1900,10 +1987,10 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        let target_pane_borders = !app.state.pane_borders;
+        let target_pane_borders = crate::config::PaneBordersConfig::Always;
         std::fs::write(
             &path,
-            format!("[ui]\npane_borders = {target_pane_borders}\nmouse_captur = false\n"),
+            "[ui]\npane_borders = \"always\"\nmouse_captur = false\n",
         )
         .unwrap();
 
@@ -1940,8 +2027,10 @@ mod tests {
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.prefix_code, KeyCode::Char(' '));
-        assert_eq!(app.state.prefix_mods, KeyModifiers::CONTROL);
+        assert_eq!(
+            app.state.prefix_keys,
+            vec![(KeyCode::Char(' '), KeyModifiers::CONTROL)]
+        );
         assert!(app
             .state
             .keybinds
@@ -2030,16 +2119,13 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
+        let original_prefix = app.state.prefix_keys.clone();
         let original_keybinds = app.state.keybinds.new_workspace.clone();
         let original_toast_delivery = app.state.toast_config.delivery;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Failed);
-        assert_eq!(
-            (app.state.prefix_code, app.state.prefix_mods),
-            original_prefix
-        );
+        assert_eq!(app.state.prefix_keys, original_prefix);
         assert_eq!(app.state.keybinds.new_workspace, original_keybinds);
         assert_eq!(app.state.toast_config.delivery, original_toast_delivery);
         assert!(app
@@ -2626,7 +2712,7 @@ mod tests {
     async fn pane_split_request_applies_ratio() {
         let _guard = config_env_lock().lock().unwrap();
         let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", "/usr/bin/true");
+        std::env::set_var("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let workspace = Workspace::test_new("api-pane-split-ratio");
@@ -2679,10 +2765,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_panes_start_at_the_size_their_tab_layout_gives_them() {
+        let mut app = test_app();
+        let mut visible = Workspace::test_new("visible-with-tiny-first-pane");
+        let first = visible.tabs[0].root_pane;
+        for _ in 0..4 {
+            visible.tabs[0].layout.focus_pane(first);
+            visible.test_split(ratatui::layout::Direction::Vertical);
+        }
+        app.state.workspaces = vec![visible];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let area = Rect::new(0, 0, 120, 40);
+        crate::ui::compute_view_without_resizing_panes(
+            &mut app.state,
+            &app.terminal_runtimes,
+            area,
+        );
+        assert!(app.state.view.pane_infos[0].rect.height <= 3);
+
+        let size_of = |app: &App, ws_idx: usize, pane_id| {
+            app.state
+                .runtime_for_pane_in_workspace(&app.terminal_runtimes, ws_idx, pane_id)
+                .unwrap()
+                .current_size()
+        };
+        let relayout = |app: &App, ws_idx: usize| {
+            crate::ui::resize_tab_surface(
+                &app.state,
+                &app.terminal_runtimes,
+                ws_idx,
+                0,
+                area,
+                crate::kitty_graphics::HostCellSize::default(),
+            );
+        };
+
+        let ws_idx = app
+            .create_workspace_with_options(std::env::temp_dir(), false)
+            .unwrap();
+        assert_eq!(app.state.active, Some(0));
+        let root = app.state.workspaces[ws_idx].tabs[0].root_pane;
+        let spawned = size_of(&app, ws_idx, root);
+        relayout(&app, ws_idx);
+        assert_eq!(size_of(&app, ws_idx, root), spawned);
+        assert!(spawned.0 > 30, "hidden root spawned at {spawned:?}");
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "req_hidden_split_size".into(),
+                method: crate::api::schema::Method::PaneSplit(
+                    crate::api::schema::PaneSplitParams {
+                        workspace_id: None,
+                        target_pane_id: Some(app.pane_info(ws_idx, root).unwrap().pane_id),
+                        direction: crate::api::schema::SplitDirection::Down,
+                        ratio: Some(0.3),
+                        cwd: None,
+                        focus: false,
+                        right_click: Default::default(),
+                        env: Default::default(),
+                    },
+                ),
+            });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let (_, new_pane) = app
+            .parse_pane_id(response["result"]["pane"]["pane_id"].as_str().unwrap())
+            .unwrap();
+        let spawned = size_of(&app, ws_idx, new_pane);
+        relayout(&app, ws_idx);
+        assert_eq!(size_of(&app, ws_idx, new_pane), spawned);
+
+        for (_terminal_id, runtime) in app.terminal_runtimes.drain().collect::<Vec<_>>() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
     async fn pane_split_request_uses_active_focused_pane_when_target_is_omitted() {
         let _guard = config_env_lock().lock().unwrap();
         let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", "/usr/bin/true");
+        std::env::set_var("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let workspace = Workspace::test_new("api-pane-split-current");
@@ -2782,9 +2945,9 @@ mod tests {
             id: "req_agent_start_input".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
                 name: "worker".into(),
-                kind: "pi".into(),
+                kind: "codex".into(),
                 pane_id: pane_id.clone(),
-                args: Vec::new(),
+                args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
             }),
         };
@@ -2792,6 +2955,9 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["error"]["code"], "agent_start_input_failed");
         assert_eq!(app.state.terminals[&terminal_id].agent_name, None);
+        assert!(app.state.terminals[&terminal_id]
+            .persisted_agent_session
+            .is_none());
         assert_eq!(
             app.state.terminals[&terminal_id].manual_label.as_deref(),
             Some("shell")
@@ -2804,6 +2970,15 @@ mod tests {
         let retry = app.handle_api_request(request());
         let retry: serde_json::Value = serde_json::from_str(&retry).unwrap();
         assert_eq!(retry["result"]["type"], "agent_started");
+        assert_eq!(
+            retry["result"]["agent"]["agent_session"],
+            serde_json::json!({
+                "source": "herdr:codex",
+                "agent": "codex",
+                "kind": "id",
+                "value": "codex-session",
+            })
+        );
         assert_eq!(
             app.state.terminals[&terminal_id].agent_name.as_deref(),
             Some("worker")
@@ -3022,6 +3197,118 @@ mod tests {
         done_rx.try_recv().unwrap();
         assert!(app.session_save_thread.is_none());
     }
+
+    #[tokio::test]
+    async fn pane_exit_checkpoint_survives_automatic_workspace_creation_on_shutdown() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("signaled-pane-session-checkpoint");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        let mut workspace = Workspace::test_new("preserved");
+        let first_pane = workspace.tabs[0].root_pane;
+        let second_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: first_pane,
+            exit_reason: crate::platform::ChildExitReason::Interrupted,
+        });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: second_pane,
+            exit_reason: crate::platform::ChildExitReason::Interrupted,
+        });
+        assert!(app.state.workspaces.is_empty());
+        assert!(app.ensure_default_workspace());
+
+        app.save_session_on_shutdown();
+
+        let snapshot = crate::persist::load().expect("checkpointed session should survive");
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].tabs[0].panes.len(), 2);
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn normal_autosave_replaces_a_signaled_exit_checkpoint() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("signaled-pane-autosave");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        let workspace = Workspace::test_new("closed");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            exit_reason: crate::platform::ChildExitReason::Interrupted,
+        });
+        assert!(crate::persist::load().is_some());
+
+        app.start_background_session_save();
+        if let Some(thread) = app.session_save_thread.take() {
+            thread.join().unwrap();
+        }
+        app.save_session_on_shutdown();
+
+        assert!(crate::persist::load().is_none());
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn durable_mutation_after_pane_exit_checkpoint_wins_on_shutdown() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("pane-exit-newer-session-state");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+
+        for another_interrupted_exit in [false, true] {
+            let mut app = test_app();
+            app.policy.persist_session = true;
+            let workspace = Workspace::test_new("old");
+            let pane_id = workspace.tabs[0].root_pane;
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+
+            app.handle_internal_event(AppEvent::PaneDied {
+                pane_id,
+                exit_reason: crate::platform::ChildExitReason::Interrupted,
+            });
+            app.state.workspaces = vec![Workspace::test_new("newer")];
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            app.state.mark_session_dirty();
+            if another_interrupted_exit {
+                app.handle_internal_event(AppEvent::PaneDied {
+                    pane_id: app.state.workspaces[0].tabs[0].root_pane,
+                    exit_reason: crate::platform::ChildExitReason::Interrupted,
+                });
+            }
+            app.save_session_on_shutdown();
+
+            let snapshot = crate::persist::load().expect("newer session should be saved");
+            assert_eq!(snapshot.workspaces.len(), 1);
+            assert_eq!(snapshot.workspaces[0].custom_name.as_deref(), Some("newer"));
+        }
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
     #[tokio::test]
     async fn full_internal_event_queue_eventually_applies_working_to_idle_transition() {
         let mut app = test_app();

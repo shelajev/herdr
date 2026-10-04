@@ -255,22 +255,25 @@ impl App {
         .map_err(|(_, message)| message)
     }
 
-    pub(super) fn handle_pane_link_activate(
-        &mut self,
-        id: String,
-        params: PaneLinkActivateParams,
-    ) -> String {
+    fn read_checked_pane_link<T>(
+        &self,
+        id: &str,
+        params: &PaneLinkActivateParams,
+        operation: &str,
+        read: impl FnOnce(&crate::terminal::TerminalRuntime, u16, u16) -> T,
+    ) -> Result<(crate::layout::PaneId, T), String> {
+        let error = |code, message: &str| encode_error(id.to_owned(), code, message);
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return encode_error(id, "pane_not_found", "pane not found");
+            return Err(error("pane_not_found", "pane not found"));
         };
         if !self.state.pane_visible_on_active_surface(ws_idx, pane_id) {
-            return encode_error(id, "stale_target", "pane is no longer visible");
+            return Err(error("stale_target", "pane is no longer visible"));
         }
         let Some(runtime) =
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
         else {
-            return encode_error(id, "pane_not_found", "pane runtime not found");
+            return Err(error("pane_not_found", "pane runtime not found"));
         };
         let current_offset = runtime
             .scroll_metrics()
@@ -279,11 +282,10 @@ impl App {
             .offset_from_bottom
             .is_some_and(|expected| current_offset != Some(expected))
         {
-            return encode_error(
-                id,
+            return Err(error(
                 "stale_content",
-                "pane viewport changed before link activation",
-            );
+                &format!("pane viewport changed before link {operation}"),
+            ));
         }
         let content_revision = runtime.content_seq();
         if content_revision % 2 != 0
@@ -291,31 +293,53 @@ impl App {
                 .content_revision
                 .is_some_and(|expected| expected != content_revision)
         {
-            return encode_error(
-                id,
+            return Err(error(
                 "stale_content",
-                "pane content changed before link activation",
-            );
+                &format!("pane content changed before link {operation}"),
+            ));
         }
-        let url = self.state.url_at_pane_surface_cell(
-            &self.terminal_runtimes,
-            ws_idx,
-            pane_id,
-            params.viewport_row,
-            params.col,
-        );
+        let value = read(runtime, params.col, params.viewport_row);
         if runtime.content_seq() != content_revision
             || runtime
                 .scroll_metrics()
                 .map(|metrics| metrics.offset_from_bottom as u64)
                 != current_offset
         {
-            return encode_error(
-                id,
+            return Err(error(
                 "stale_content",
-                "pane content or viewport changed during link activation",
-            );
+                &format!("pane content or viewport changed during link {operation}"),
+            ));
         }
+        Ok((pane_id, value))
+    }
+
+    pub(super) fn handle_pane_link_resolve(
+        &mut self,
+        id: String,
+        params: PaneLinkActivateParams,
+    ) -> String {
+        match self.read_checked_pane_link(&id, &params, "resolution", |runtime, col, row| {
+            runtime.link_regions_at(col, row, crate::app::actions::url_byte_range)
+        }) {
+            Ok((_, regions)) => encode_success(id, ResponseResult::PaneLinkResolved { regions }),
+            Err(error) => error,
+        }
+    }
+
+    pub(super) fn handle_pane_link_activate(
+        &mut self,
+        id: String,
+        params: PaneLinkActivateParams,
+    ) -> String {
+        let (pane_id, url) =
+            match self.read_checked_pane_link(&id, &params, "activation", |runtime, col, row| {
+                runtime
+                    .link_target_at(col, row)
+                    .and_then(crate::app::actions::url_from_link_target)
+            }) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
         let handled = match url.as_deref() {
             Some(url) => match self.invoke_plugin_link_handler_for_url(url, pane_id) {
                 Ok(handled) => handled,
@@ -440,7 +464,7 @@ impl App {
         let Some(entrypoint) = normalize_action_id(&params.entrypoint) else {
             return encode_error(id, "invalid_plugin_entrypoint", "invalid entrypoint id");
         };
-        let Some(pane) = plugin
+        let Some(mut pane) = plugin
             .panes
             .iter()
             .find(|pane| pane.id == entrypoint)
@@ -458,6 +482,12 @@ impl App {
         ) {
             return encode_error(id, code, message);
         }
+        pane.command[0] = crate::plugin_command::program_for_cwd(
+            &pane.command[0],
+            std::path::Path::new(&plugin.plugin_root),
+        )
+        .display()
+        .to_string();
         let placement = params.placement.unwrap_or(pane.placement);
         if placement != PluginPanePlacement::Popup
             && (params.width.is_some() || params.height.is_some())
@@ -783,6 +813,71 @@ mod tests {
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[tokio::test]
+    async fn pane_link_resolve_checks_staleness_without_side_effects() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("hover")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 4);
+        runtime.test_process_pty_bytes(b"https://example.com");
+        let revision = runtime.content_seq();
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let params = PaneLinkActivateParams {
+            pane_id: public_id,
+            viewport_row: 0,
+            col: 1,
+            content_revision: Some(revision),
+            offset_from_bottom: Some(0),
+        };
+        let response = app.handle_api_request(Request {
+            id: "hover".into(),
+            method: Method::PaneLinkResolve(params.clone()),
+        });
+        assert!(
+            matches!(response_result(&response), ResponseResult::PaneLinkResolved { regions } if regions.len() == 1)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "resolution must not write to the PTY"
+        );
+        for stale in [
+            PaneLinkActivateParams {
+                content_revision: Some(revision + 2),
+                ..params.clone()
+            },
+            PaneLinkActivateParams {
+                offset_from_bottom: Some(1),
+                ..params.clone()
+            },
+        ] {
+            let response = app.handle_pane_link_resolve("hover".into(), stale);
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["error"]["code"], "stale_content");
+        }
+        let changed =
+            app.read_checked_pane_link("hover", &params, "resolution", |runtime, _, _| {
+                runtime.test_process_pty_bytes(b"changed");
+            });
+        let response: serde_json::Value = serde_json::from_str(&changed.unwrap_err()).unwrap();
+        assert_eq!(response["error"]["code"], "stale_content");
+        assert_eq!(
+            response["error"]["message"],
+            "pane content or viewport changed during link resolution"
+        );
+        assert!(rx.try_recv().is_err());
+
+        app.state.active = None;
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_pane_link_resolve("hover".into(), params)).unwrap();
+        assert_eq!(response["error"]["code"], "stale_target");
+    }
+
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
@@ -987,7 +1082,16 @@ platforms = ["linux", "macos", "windows"]
         assert_eq!(plugin.plugin_id, "example.worktree-bootstrap");
         assert_eq!(plugin.name, "Worktree Bootstrap");
         assert_eq!(plugin.version, "0.1.0");
-        assert_eq!(plugin.plugin_root, canonical_path_string(&root));
+        assert_eq!(
+            plugin.manifest_path,
+            canonical_path_string(&root.join("herdr-plugin.toml"))
+        );
+        assert_eq!(
+            plugin.plugin_root,
+            crate::platform::plugin_runtime_path(&root.canonicalize().unwrap())
+                .display()
+                .to_string()
+        );
         assert!(plugin.enabled);
         assert_eq!(plugin.build.len(), 1);
         assert_eq!(plugin.build[0].command, ["bun", "install"]);
@@ -1464,6 +1568,281 @@ platforms = ["linux", "macos"]
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["error"]["code"], "invalid_params");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_plugin_pane_commands_resolve_from_plugin_root_with_cwd_override() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("plugin-pane-paths")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Terminal;
+
+        let root = unique_temp_path("plugin-pane-paths");
+        let child_cwd = root.join("child-cwd");
+        std::fs::create_dir_all(&child_cwd).unwrap();
+        let cleanup_root = root.canonicalize().unwrap();
+        let tool = root.join("tool.exe");
+        let long_where_relative = format!("bin/{}/where.exe", "x".repeat(220));
+        let long_where = root.join(&long_where_relative);
+        std::fs::create_dir_all(long_where.parent().unwrap()).unwrap();
+        let shell = std::env::var_os("ComSpec").expect("ComSpec");
+        std::fs::copy(&shell, &tool).unwrap();
+        let where_exe = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/where.exe");
+        std::fs::copy(where_exe, &long_where).unwrap();
+        let where_probe = "herdr-long-path-probe.exe";
+        std::fs::write(child_cwd.join(where_probe), b"").unwrap();
+        assert!(
+            root.as_os_str().encode_wide().count()
+                < windows_sys::Win32::Foundation::MAX_PATH as usize
+        );
+        assert!(
+            long_where.as_os_str().encode_wide().count()
+                >= windows_sys::Win32::Foundation::MAX_PATH as usize
+        );
+        let script = "@echo off\r\n(echo %1&cd)>capture-%1.tmp\r\nmove /y capture-%1.tmp capture-%1.txt >nul\r\n";
+        std::fs::write(root.join("slot.cmd"), script).unwrap();
+        std::fs::write(child_cwd.join("slot.cmd"), script).unwrap();
+        write_manifest_content(
+            &root,
+            &format!(
+                r#"
+id = "example.pane-paths"
+name = "Pane Paths"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["windows"]
+
+[[panes]]
+id = "explicit"
+title = "Explicit"
+command = ["./tool.exe", "/d", "/c", "slot.cmd", "explicit"]
+
+[[panes]]
+id = "bare"
+title = "Bare"
+command = ["tool.exe", "/d", "/c", "slot.cmd", "bare"]
+
+[[panes]]
+id = "path"
+title = "Path"
+command = ["cmd.exe", "/d", "/c", "slot.cmd", "path"]
+
+[[panes]]
+id = "absolute"
+title = "Absolute"
+command = ['{}', "/d", "/c", "slot.cmd", "absolute"]
+
+[[panes]]
+id = "long"
+title = "Long executable"
+command = ['./{}', "{}"]
+
+[[panes]]
+id = "default"
+title = "Default cwd"
+command = ["cmd.exe", "/d", "/c", "slot.cmd", "default"]
+"#,
+                tool.display(),
+                long_where_relative,
+                where_probe
+            ),
+        );
+        link_manifest(&mut app, &root);
+
+        for (entrypoint, cwd) in [
+            ("explicit", Some(&child_cwd)),
+            ("bare", Some(&child_cwd)),
+            ("path", Some(&child_cwd)),
+            ("absolute", Some(&child_cwd)),
+            ("long", Some(&child_cwd)),
+            ("default", None),
+        ] {
+            let expected_cwd = cwd.unwrap_or(&root);
+            let open = app.handle_api_request(Request {
+                id: format!("pane-open-{entrypoint}"),
+                method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                    plugin_id: "example.pane-paths".into(),
+                    entrypoint: entrypoint.into(),
+                    placement: Some(PluginPanePlacement::Split),
+                    width: None,
+                    height: None,
+                    workspace_id: None,
+                    target_pane_id: None,
+                    direction: None,
+                    cwd: cwd.map(|path| path.display().to_string()),
+                    focus: false,
+                    env: std::collections::HashMap::new(),
+                }),
+            });
+            let ResponseResult::PluginPaneOpened { plugin_pane } = response_result(&open) else {
+                panic!("failed to open {entrypoint} plugin pane: {open}");
+            };
+            if entrypoint == "long" {
+                let Some((ws_idx, pane_id)) = app.parse_pane_id(&plugin_pane.pane.pane_id) else {
+                    panic!("opened pane id should parse");
+                };
+                let runtime = app
+                    .state
+                    .runtime_for_pane_in_workspace(&app.terminal_runtimes, ws_idx, pane_id)
+                    .expect("long executable pane runtime");
+                let expected = child_cwd.join(where_probe).canonicalize().unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    // The pane is a narrow split, so the long path wraps across many rows.
+                    let text = runtime.recent_unwrapped_text(400);
+                    if text.lines().any(|line| {
+                        std::fs::canonicalize(line.trim()).is_ok_and(|path| path == expected)
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "long where.exe output missing from pane: {text:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                continue;
+            }
+            let capture = read_capture_when_ready(
+                &expected_cwd.join(format!("capture-{entrypoint}.txt")),
+                || {},
+            );
+            let mut lines = capture.lines();
+            assert_eq!(lines.next(), Some(entrypoint));
+            let actual_cwd = std::fs::canonicalize(lines.next().expect("captured cwd")).unwrap();
+            assert_eq!(actual_cwd, expected_cwd.canonicalize().unwrap());
+        }
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        // PTY actor shutdown is queued, so its Windows handles can outlive `shutdown()`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::fs::remove_dir_all(&cleanup_root) {
+                Ok(()) => break,
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "failed to remove {} after runtime shutdown: {error}",
+                        cleanup_root.display()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn plugin_launch_survives_executable_replacement() {
+        const CHILD_ROOT: &str = "HERDR_TEST_PLUGIN_REPLACEMENT_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let executable = std::env::current_exe().unwrap();
+            let replacement = root.join("replacement");
+            std::fs::copy(&executable, &replacement).unwrap();
+            std::fs::rename(&replacement, &executable).unwrap();
+            assert!(!std::env::current_exe().unwrap().exists());
+
+            let mut app = test_app();
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("plugin-update")];
+            app.state.ensure_test_terminals();
+            app.state.active = Some(0);
+            app.state.selected = 0;
+            app.state.mode = crate::app::Mode::Terminal;
+            let plugin_root = root.join("plugin");
+            write_manifest_content(
+                &plugin_root,
+                r#"
+id = "example.update"
+name = "Update Probe"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux"]
+
+[[actions]]
+id = "probe"
+title = "Probe executable"
+command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" > action-status']
+
+[[panes]]
+id = "probe"
+title = "Probe executable"
+command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" > pane-status']
+"#,
+            );
+            link_manifest(&mut app, &plugin_root);
+            app.invoke_plugin_action_from_keybind("example.update.probe".into(), None)
+                .unwrap();
+            let action_status = read_capture_when_ready(&plugin_root.join("action-status"), || {
+                app.drain_all_internal_events();
+            });
+            let open = app.handle_api_request(Request {
+                id: "update-pane".into(),
+                method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                    plugin_id: "example.update".into(),
+                    entrypoint: "probe".into(),
+                    placement: Some(PluginPanePlacement::Overlay),
+                    width: None,
+                    height: None,
+                    workspace_id: None,
+                    target_pane_id: None,
+                    direction: None,
+                    cwd: None,
+                    focus: true,
+                    env: std::collections::HashMap::new(),
+                }),
+            });
+            assert!(matches!(
+                response_result(&open),
+                ResponseResult::PluginPaneOpened { .. }
+            ));
+            let pane_status = read_capture_when_ready(&plugin_root.join("pane-status"), || {});
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+            assert_eq!(
+                (action_status.trim(), pane_status.trim()),
+                ("0", "0"),
+                "plugin action and pane must launch Herdr after its executable is replaced"
+            );
+            return;
+        }
+
+        let root = std::path::PathBuf::from("/var/tmp").join(format!(
+            "herdr-plugin-update-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("herdr test");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let result = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "app::api::plugins::tests::plugin_launch_survives_executable_replacement",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &root)
+            .output();
+        std::fs::remove_dir_all(&root).unwrap();
+        let output = result.unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]
@@ -2027,6 +2406,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
         app.handle_internal_event(crate::events::AppEvent::PaneDied {
             pane_id: opened_pane_id,
+            exit_reason: crate::platform::ChildExitReason::Exited,
         });
         assert!(app.state.popup_pane.is_none());
         assert!(event_hub.events_after(0).is_empty());
@@ -2949,6 +3329,7 @@ action = "missing"
                 seq: None,
                 agent_session_id: None,
                 agent_session_path: None,
+                resume_argv: None,
             },
         );
 
@@ -3265,7 +3646,10 @@ command = ["sh", "-c", "echo ok"]
             },
         );
 
-        app.handle_internal_event(crate::events::AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        });
 
         assert!(!app.state.plugin_panes.contains_key(&pane_id));
     }

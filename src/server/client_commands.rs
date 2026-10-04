@@ -13,10 +13,12 @@ pub(crate) const MAX_ENDPOINT_REQUEST_ID_BYTES: usize = 128;
 const ENDPOINT_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 
 const CLIENT_SHELL_METHODS: &[&str] = &[
+    "client_shell.surface.set",
     "command.invoke",
     "integration.install",
     "integration.list",
     "layout.set_split_ratio",
+    "pane.clear",
     "pane.close",
     "pane.copy_motion",
     "pane.copy_search",
@@ -25,6 +27,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "pane.focus_direction",
     "pane.input.set",
     "pane.link.activate",
+    "pane.link.resolve",
     "pane.rename",
     "pane.resize",
     "pane.scroll",
@@ -75,6 +78,30 @@ pub(crate) fn error_response(id: String, code: &str, message: impl Into<String>)
     .unwrap_or_else(|_| {
         r#"{"id":"","error":{"code":"serialization_error","message":"failed to serialize endpoint response"}}"#.into()
     })
+}
+
+pub(crate) fn success_message_with_result(
+    boot_id: String,
+    request_id: String,
+    result: crate::api::schema::ResponseResult,
+) -> crate::protocol::ServerMessage {
+    let response = serde_json::to_string(&crate::api::schema::SuccessResponse {
+        id: request_id.clone(),
+        result,
+    })
+    .unwrap_or_else(|_| {
+        error_response(
+            request_id.clone(),
+            "serialization_error",
+            "failed to serialize endpoint response",
+        )
+    });
+    crate::protocol::ServerMessage::ClientShellEndpointResponseChunk {
+        boot_id,
+        request_id,
+        final_chunk: true,
+        data: response.into_bytes(),
+    }
 }
 
 pub(crate) fn error_message(
@@ -260,11 +287,19 @@ mod tests {
             "/tests/fixtures/endpoint-method-shapes-v1.json"
         )))
         .expect("endpoint method shape fixture");
-        let actual = endpoint_method_shape_digests();
+        let mut actual = endpoint_method_shape_digests();
+        // Freeze additive methods separately without rewriting the published fixture.
+        assert_eq!(
+            actual.remove("pane.clear").as_deref(),
+            Some("0301d288ba198ddaa427dd7421c71911cccaf4ea03544531efa8b67ca21b08f6")
+        );
+        assert_eq!(
+            actual.remove("pane.link.resolve").as_deref(),
+            Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
+        );
 
         assert_eq!(
-            actual,
-            expected,
+            actual, expected,
             "an existing endpoint method changed shape; add load-bearing behavior as a new advertised method or explicitly gate new fields"
         );
     }
@@ -312,10 +347,24 @@ mod tests {
 
     #[test]
     fn client_shell_lane_excludes_api_front_door_and_lifecycle_methods() {
+        assert!(supports_client_shell_method(
+            &Method::ClientShellSurfaceSet(crate::api::schema::ClientShellSurfaceSetParams {
+                active: false,
+            })
+        ));
         assert!(supports_client_shell_method(&Method::ServerReloadConfig(
             crate::api::schema::EmptyParams::default(),
         )));
         assert!(supports_client_shell_method(&Method::PaneLinkActivate(
+            crate::api::schema::PaneLinkActivateParams {
+                pane_id: "w1:p1".into(),
+                viewport_row: 0,
+                col: 0,
+                content_revision: None,
+                offset_from_bottom: None,
+            },
+        )));
+        assert!(supports_client_shell_method(&Method::PaneLinkResolve(
             crate::api::schema::PaneLinkActivateParams {
                 pane_id: "w1:p1".into(),
                 viewport_row: 0,

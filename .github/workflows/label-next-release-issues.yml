@@ -13,6 +13,9 @@ env:
 
 jobs:
   close:
+    # Fork guard: this repository is a custom fork. Publishing jobs act on
+    # upstream-owned services, so they run only in the canonical repository.
+    if: github.repository == 'herdrdev/herdr'
     runs-on: ubuntu-latest
 
     steps:
