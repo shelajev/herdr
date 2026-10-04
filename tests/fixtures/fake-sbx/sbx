@@ -1,0 +1,66 @@
+#!/bin/sh
+# Fake `sbx` for herdr's task-driver tests. It is NOT the real Docker SBX.
+#
+# It implements only what the tests drive:
+#   sbx mcp add NAME --command CMD [--args A]... [--dir D]   register a host MCP server
+#   sbx create KIT WORKSPACE --name N ... [--static-mcp NAME]...
+#       fails if a --static-mcp name was not registered; otherwise writes, per name, the
+#       launcher a gateway would run: exactly the host-registered command and arguments
+#   sbx rm NAME                                               record and succeed
+# Every call is appended to $FAKE_SBX_STATE/calls.log, one argument per line.
+set -u
+state="${FAKE_SBX_STATE:?FAKE_SBX_STATE must name a writable directory}"
+mkdir -p "$state/mcp" "$state/sandboxes"
+{ echo "--- call"; for a in "$@"; do printf '%s\n' "$a"; done; } >> "$state/calls.log"
+
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+case "${1:-}" in
+mcp)
+  [ "${2:-}" = add ] || exit 0
+  name="${3:?name}"; shift 3
+  reg="$state/mcp/$name"; : > "$reg"
+  cmd=""; args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --command) cmd="$2"; shift 2 ;;
+      --args) args="$args
+$2"; shift 2 ;;
+      --args=*) args="$args
+${1#--args=}"; shift ;;
+      --dir) shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf '%s%s\n' "$cmd" "$args" > "$reg"
+  ;;
+create)
+  shift
+  sandbox=""; mcps=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) sandbox="$2"; shift 2 ;;
+      --static-mcp) mcps="$mcps $2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  for name in $mcps; do
+    if [ ! -f "$state/mcp/$name" ]; then
+      echo "fake sbx: static MCP server $name is not registered" >&2
+      exit 3
+    fi
+  done
+  dir="$state/sandboxes/$sandbox"; mkdir -p "$dir"
+  for name in $mcps; do
+    launcher="$dir/mcp-$name.sh"
+    {
+      echo '#!/bin/sh'
+      printf 'exec'
+      while IFS= read -r line; do printf ' %s' "$(quote "$line")"; done < "$state/mcp/$name"
+      echo
+    } > "$launcher"
+    chmod +x "$launcher"
+  done
+  ;;
+esac
+exit 0

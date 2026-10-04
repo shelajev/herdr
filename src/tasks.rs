@@ -11,6 +11,10 @@
 pub(crate) const TASK_SANDBOX_PREFIX: &str = "herdr-task-";
 pub(crate) const DEFAULT_KIT: &str = "docker.io/olegselajev241/herdr-crew-kit:latest";
 pub(crate) const KIT_ENV_VAR: &str = "HERDR_TASK_KIT";
+/// Comma-separated static MCP names used when `task new` gets no `--mcp` flag.
+pub(crate) const MCP_ENV_VAR: &str = "HERDR_TASK_MCP";
+/// Upper bound on static MCP servers attached to one task.
+const MAX_MCP_SERVERS: usize = 8;
 
 /// Sandbox-owned pins. The kit's models file is the only source of defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +207,74 @@ pub(crate) fn validate_slug(slug: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A static MCP server is a host-registered resource referenced by name only
+/// (registered on the host with `sbx mcp add`). The name never selects an
+/// executable, path, URL, or arguments, so it is held to a short conservative
+/// grammar: 1-64 ASCII lowercase letters, digits, `-` and `_`, starting with a
+/// letter or digit and not ending in `-` or `_`.
+pub(crate) fn validate_mcp_name(name: &str) -> Result<(), String> {
+    let shown: String = name.chars().take(32).collect();
+    if name.is_empty() || name.len() > 64 {
+        return Err(format!(
+            "MCP server name must be 1-64 characters (got {} bytes: {shown:?})",
+            name.len()
+        ));
+    }
+    let bytes = name.as_bytes();
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+    {
+        return Err(format!(
+            "MCP server name may only contain lowercase ASCII letters, digits, '-' and '_': {shown:?}; \
+             it names a server already registered on this host, never a path, URL or command"
+        ));
+    }
+    if !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
+        return Err(format!(
+            "MCP server name must start with a letter or digit: {shown:?}"
+        ));
+    }
+    if matches!(bytes[bytes.len() - 1], b'-' | b'_') {
+        return Err(format!(
+            "MCP server name may not end with '-' or '_': {shown:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the static MCP names for `task new`: explicit `--mcp` flags win;
+/// otherwise a comma-separated `HERDR_TASK_MCP` supplies a host default (same
+/// flags-then-environment precedence as the model overrides). A set-but-empty
+/// variable means none. Every name is validated, duplicates and more than
+/// `MAX_MCP_SERVERS` are rejected, and nothing here checks that a name is
+/// registered: that is the host's `sbx` registry's job.
+pub(crate) fn resolve_mcp_names(
+    flags: &[String],
+    env_value: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let (names, source): (Vec<String>, &str) = if !flags.is_empty() {
+        (flags.to_vec(), "--mcp")
+    } else if let Some(value) = env_value.filter(|value| !value.is_empty()) {
+        (value.split(',').map(str::to_string).collect(), MCP_ENV_VAR)
+    } else {
+        return Ok(Vec::new());
+    };
+    if names.len() > MAX_MCP_SERVERS {
+        return Err(format!(
+            "at most {MAX_MCP_SERVERS} MCP servers per task ({source} gave {})",
+            names.len()
+        ));
+    }
+    for (index, name) in names.iter().enumerate() {
+        validate_mcp_name(name).map_err(|err| format!("{source}: {err}"))?;
+        if names[..index].contains(name) {
+            return Err(format!("{source}: duplicate MCP server name {name}"));
+        }
+    }
+    Ok(names)
+}
+
 pub(crate) fn sandbox_name(slug: &str) -> String {
     format!("{TASK_SANDBOX_PREFIX}{slug}")
 }
@@ -281,13 +353,16 @@ pub(crate) fn parse_roles(value: &str) -> Result<RoleAssignment, String> {
 
 /// `sbx create` argv provisioning a task sandbox from the herdr-crew kit.
 /// Each mixin becomes an sbx `--kit` flag, stacking extra tools, network
-/// rules, and agent memory onto the crew sandbox at creation.
+/// rules, and agent memory onto the crew sandbox at creation. Each MCP name
+/// (already validated by `resolve_mcp_names`) becomes an sbx `--static-mcp`
+/// flag after the mixins, attaching a server the host registered beforehand.
 pub(crate) fn sbx_create_argv(
     kit: &str,
     workspace_dir: &str,
     slug: &str,
     roles: &RoleAssignment,
     mixins: &[String],
+    mcps: &[String],
     model_args: &[String],
 ) -> Vec<String> {
     let mut argv = vec![
@@ -306,6 +381,10 @@ pub(crate) fn sbx_create_argv(
     for mixin in mixins {
         argv.push("--kit".to_string());
         argv.push(mixin.clone());
+    }
+    for mcp in mcps {
+        argv.push("--static-mcp".to_string());
+        argv.push(mcp.clone());
     }
     argv
 }
@@ -1129,7 +1208,7 @@ mod tests {
             ]
         );
         let roles = rotation_for("demo");
-        let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &[], &args);
+        let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &[], &[], &args);
         assert!(argv.ends_with(&args));
         assert!(ModelOverrides {
             codex: Some("$(id)".into()),
@@ -1143,7 +1222,15 @@ mod tests {
     fn sbx_create_argv_provisions_named_sandbox_with_roles_and_mixins() {
         let roles = parse_roles("orchestrator=gemini,planner=gemini,implementer=codex,qc=claude")
             .expect("valid roles should parse");
-        let argv = sbx_create_argv("./kits/herdr-crew/", "/work/repo", "demo", &roles, &[], &[]);
+        let argv = sbx_create_argv(
+            "./kits/herdr-crew/",
+            "/work/repo",
+            "demo",
+            &roles,
+            &[],
+            &[],
+            &[],
+        );
         assert_eq!(
             argv,
             [
@@ -1171,6 +1258,7 @@ mod tests {
             &roles,
             &mixins,
             &[],
+            &[],
         );
         // Asserted as the trailing flag pairs rather than a fixed index, so
         // inserting another option earlier does not silently need a hand-edited
@@ -1192,6 +1280,222 @@ mod tests {
         );
     }
 
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn static_mcp_names_become_repeated_flag_pairs_after_the_mixins() {
+        let roles = parse_roles("orchestrator=gemini,planner=gemini,implementer=codex,qc=claude")
+            .expect("valid roles should parse");
+        let mixins = names(&["git+https://example.invalid/acr.git#ref=abc"]);
+        let mcps = names(&["central-beans", "second_server"]);
+        let models = names(&["--kit-arg", "claude_model=m1"]);
+        let argv = sbx_create_argv(
+            DEFAULT_KIT,
+            "/work/repo",
+            "demo",
+            &roles,
+            &mixins,
+            &mcps,
+            &models,
+        );
+
+        // Exact tail: model args, then mixins as --kit, then --static-mcp pairs.
+        assert_eq!(
+            argv[argv.len() - 8..],
+            [
+                "--kit-arg",
+                "claude_model=m1",
+                "--kit",
+                "git+https://example.invalid/acr.git#ref=abc",
+                "--static-mcp",
+                "central-beans",
+                "--static-mcp",
+                "second_server",
+            ]
+        );
+        // One flag per name, in the order given, each followed by its name only.
+        let pairs: Vec<&str> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--static-mcp")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(pairs, ["central-beans", "second_server"]);
+        // The MCP name never leaks into the other option values.
+        assert_eq!(flag_value(&argv, "--skills").as_deref(), Some("off"));
+        assert_eq!(
+            argv.iter()
+                .filter(|arg| arg.as_str() == "--static-mcp")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn argv_without_mcp_is_identical_to_the_legacy_shape() {
+        // Regression: omitting --mcp must not change a single element, with or
+        // without mixins and model arguments.
+        let roles = rotation_for("demo");
+        let mixins = names(&["docker.io/example/mixin:1"]);
+        let models = names(&["--kit-arg", "codex_model=m2"]);
+        for (mixins, models) in [
+            (Vec::new(), Vec::new()),
+            (mixins.clone(), Vec::new()),
+            (Vec::new(), models.clone()),
+            (mixins, models),
+        ] {
+            let argv = sbx_create_argv(
+                DEFAULT_KIT,
+                "/work/repo",
+                "demo",
+                &roles,
+                &mixins,
+                &[],
+                &models,
+            );
+            let mut expected = names(&[
+                "sbx",
+                "create",
+                DEFAULT_KIT,
+                "/work/repo",
+                "--name",
+                "herdr-task-demo",
+                "--skills",
+                "off",
+                "--kit-arg",
+            ]);
+            expected.push(format!("roles={}", roles.kit_arg()));
+            expected.extend(models.clone());
+            for mixin in &mixins {
+                expected.push("--kit".to_string());
+                expected.push(mixin.clone());
+            }
+            assert_eq!(argv, expected);
+            assert!(!argv.iter().any(|arg| arg == "--static-mcp"));
+        }
+    }
+
+    #[test]
+    fn mcp_names_accept_the_short_registered_name_grammar() {
+        for name in [
+            "central-beans",
+            "a",
+            "0",
+            "wad-ch-05-beans",
+            "a_b",
+            "x1-y2_z3",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(validate_mcp_name(name), Ok(()), "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn mcp_names_reject_paths_urls_commands_and_hostile_text() {
+        let too_long = "a".repeat(65);
+        for name in [
+            "",
+            &too_long,
+            "-central",
+            "_central",
+            "central-",
+            "central_",
+            "../central",
+            "..",
+            ".",
+            "a.b",
+            "a/b",
+            "/usr/bin/beans-mcp",
+            "~/bin/beans-mcp",
+            "C:\\tools\\beans-mcp",
+            "a\\b",
+            "https://example.com/mcp",
+            "central beans",
+            " central",
+            "central ",
+            "central\n",
+            "central\t",
+            "central\0",
+            "Central",
+            "CENTRAL-BEANS",
+            "central;id",
+            "central&&id",
+            "central|cat",
+            "central$(id)",
+            "central`id`",
+            "central>out",
+            "central<in",
+            "central*",
+            "central?",
+            "central'x",
+            "central\"x",
+            "central=1",
+            "central,other",
+            "central:80",
+            "--kit",
+            "--static-mcp",
+            "-h",
+            "caf\u{e9}",
+            "\u{ff23}entral",
+            "central\u{200b}",
+            "\u{202e}central",
+            "\u{fe0f}",
+        ] {
+            assert!(
+                validate_mcp_name(name).is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+        // A hostile megabyte is rejected without being echoed back.
+        let err = validate_mcp_name(&"a".repeat(1 << 20)).expect_err("oversize");
+        assert!(
+            err.len() < 200,
+            "error echoed the hostile value: {} bytes",
+            err.len()
+        );
+    }
+
+    #[test]
+    fn mcp_resolution_prefers_flags_then_environment_then_nothing() {
+        assert_eq!(resolve_mcp_names(&[], None), Ok(Vec::new()));
+        assert_eq!(resolve_mcp_names(&[], Some("")), Ok(Vec::new()));
+        assert_eq!(
+            resolve_mcp_names(&[], Some("central-beans,other")),
+            Ok(names(&["central-beans", "other"]))
+        );
+        // Explicit flags replace the host default entirely.
+        assert_eq!(
+            resolve_mcp_names(&names(&["flagged"]), Some("central-beans")),
+            Ok(names(&["flagged"]))
+        );
+        // An invalid ignored environment default does not block explicit flags.
+        assert_eq!(
+            resolve_mcp_names(&names(&["flagged"]), Some("../bad")),
+            Ok(names(&["flagged"]))
+        );
+    }
+
+    #[test]
+    fn mcp_resolution_rejects_bad_duplicate_and_excess_names_naming_the_source() {
+        let err = resolve_mcp_names(&names(&["good", "../bad"]), None).expect_err("bad flag");
+        assert!(err.starts_with("--mcp:"), "{err}");
+        let err = resolve_mcp_names(&[], Some("good,../bad")).expect_err("bad env");
+        assert!(err.starts_with("HERDR_TASK_MCP:"), "{err}");
+        for env in ["a,,b", ",", "a,", ",a", "a, b", "a b"] {
+            assert!(
+                resolve_mcp_names(&[], Some(env)).is_err(),
+                "{env:?} must be rejected"
+            );
+        }
+        let err = resolve_mcp_names(&names(&["dup", "dup"]), None).expect_err("duplicate");
+        assert!(err.contains("duplicate"), "{err}");
+        let nine: Vec<String> = (0..9).map(|i| format!("s{i}")).collect();
+        assert!(resolve_mcp_names(&nine, None).is_err());
+        assert!(resolve_mcp_names(&nine[..8], None).is_ok());
+        assert!(resolve_mcp_names(&[], Some(&nine.join(","))).is_err());
+    }
+
     /// The value following `flag` in an argv, so tests assert the pair rather
     /// than a position.
     fn flag_value(argv: &[String], flag: &str) -> Option<String> {
@@ -1208,7 +1512,8 @@ mod tests {
         // sbx_create_argv cannot quietly drop it.
         let roles = rotation_for("anything");
         for mixins in [vec![], vec!["docker.io/example/mixin:1".to_string()]] {
-            let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &mixins, &[]);
+            let argv =
+                sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &mixins, &[], &[]);
             assert_eq!(
                 flag_value(&argv, "--skills").as_deref(),
                 Some("off"),
@@ -1226,7 +1531,7 @@ mod tests {
             "the default kit must be a published image reference, got {DEFAULT_KIT}"
         );
         let roles = rotation_for("demo");
-        let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &[], &[]);
+        let argv = sbx_create_argv(DEFAULT_KIT, "/work/repo", "demo", &roles, &[], &[], &[]);
         assert_eq!(argv[..3], ["sbx", "create", DEFAULT_KIT]);
     }
 

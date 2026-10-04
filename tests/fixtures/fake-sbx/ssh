@@ -1,0 +1,10 @@
+#!/bin/sh
+# Fake `ssh` for herdr's task-driver tests: answers the readiness probe and the
+# model-pin read that `herdr task new` performs after `sbx create`.
+# Invoked as: ssh -o BatchMode=yes HOST REMOTE_COMMAND
+cmd="${4:-}"
+case "$cmd" in
+  *"herdr agent list"*) exit 0 ;;
+  *crew/models*) printf 'claude=claude-opus-5-5,codex=gpt-6.1-sol,pi=google/gemini-3.8-flash\n' ;;
+esac
+exit 0
