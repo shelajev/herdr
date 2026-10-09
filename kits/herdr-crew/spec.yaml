@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: sandbox
 name: herdr-crew
-version: "0.5.2"
+version: "0.5.3"
 displayName: Herdr Crew
 description: |
   Task sandbox running a nested Herdr server and a crew of coding agents
@@ -167,6 +167,8 @@ environment:
   variables:
     IS_SANDBOX: "1"
     HERDR_CREW: "1"
+    # Keep the template pin available while multiple Claude roles start.
+    DISABLE_AUTOUPDATER: "1"
     HERDR_CREW_CLAUDE_MODEL: "${{ kit.args.claude_model }}"
     HERDR_CREW_CODEX_MODEL: "${{ kit.args.codex_model }}"
     HERDR_CREW_PI_PROVIDER: "${{ kit.args.pi_provider }}"
@@ -221,6 +223,7 @@ setup:
         printf '%s' "{
           \"themeId\": 1,
           \"alwaysThinkingEnabled\": true,
+          \"env\": { \"DISABLE_AUTOUPDATER\": \"1\" },
         ${HELPER}  \"permissions\": { \"defaultMode\": \"bypassPermissions\" },
           \"bypassPermissionsModeAccepted\": true,
           \"skipDangerousModePermissionPrompt\": true
