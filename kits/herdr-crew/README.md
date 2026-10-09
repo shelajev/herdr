@@ -1,6 +1,18 @@
 # herdr-crew: task crews in Docker Sandboxes
 
-This page describes the task host driver and **0.5.2 candidate kit**. Existing
+This source tree is kit version **0.5.3**. Claude background updates are disabled
+in the kit environment and newly seeded Claude settings. This keeps the template's
+Claude executable available while multiple crew roles start. CLI upgrades belong
+to template maintenance.
+
+A source change is not published yet until `sbx kit push` succeeds. Inspect
+`docker.io/olegselajev241/herdr-crew-kit:latest` to check the deployed kit. Versioned
+tags are immutable; publish this change as `:0.5.3`, verify it in a fresh sandbox,
+then promote the same artifact to `:latest`. Existing sandboxes need the setting
+`env.DISABLE_AUTOUPDATER = "1"` in `/home/agent/.claude/settings.json`; publishing
+a kit does not change them.
+
+The deployment notes below describe the earlier **0.5.2 candidate kit**. Existing
 sandboxes keep the kit and template they were created with. The dated inventory
 and promotion steps below explain what must change before these instructions
 apply to a newly created task.
@@ -109,7 +121,7 @@ at all.
 
 ### Dated installed-state inventory
 
-This source tree is kit version **0.5.2**. It adds native Claude Code and Codex
+Kit version **0.5.2** adds native Claude Code and Codex
 configuration for the task-scoped MCP gateway without changing role, model or
 skill defaults. It reuses the immutable published ARM64 template image 0.5.1;
 it does not rebuild or overwrite image or kit versions 0.5.0 or 0.5.1.
