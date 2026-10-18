@@ -155,7 +155,12 @@ fn read_goal_ack(host: &str, timeout: Duration) -> std::io::Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let output = crate::remote::wait_with_output_timeout(child, timeout)?;
+    let output = crate::remote::wait_with_output_timeout(
+        child,
+        None,
+        timeout,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
     if !output.status.success() {
         return Err(std::io::Error::other(
             "could not read the goal acknowledgment",
