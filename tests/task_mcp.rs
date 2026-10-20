@@ -69,6 +69,9 @@ impl Fixture {
         command
             .env("PATH", path)
             .env("FAKE_SBX_STATE", self.state())
+            .env("HOME", self.root.join("home"))
+            .env("HERDR_TASK_HISTORY_ROOT", self.root.join("history"))
+            .env_remove("FAKE_SSH_USAGE_FAIL")
             .env_remove("HERDR_TASK_MCP")
             .env_remove("HERDR_TASK_KIT")
             .env_remove("HERDR_TASK_CLAUDE_MODEL")
@@ -367,6 +370,21 @@ fn task_rm_only_removes_the_sandbox_and_leaves_mcp_registrations_alone() {
         .expect("run herdr task rm");
     assert!(output.status.success(), "{}", stderr(&output));
 
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(fx.root.join("home/.local/state/herdr/task-usage/demo.json"))
+            .expect("isolated usage registry"),
+    )
+    .expect("registry JSON");
+    let archive = fx
+        .root
+        .join("history/demo")
+        .join(registry["run_id"].as_str().expect("run id"));
+    let usage: serde_json::Value =
+        serde_json::from_slice(&fs::read(archive.join("usage.json")).expect("usage exported"))
+            .expect("usage JSON");
+    assert_eq!(usage["coverage"], "partial");
+    assert_eq!(usage["missing_roles"].as_array().unwrap().len(), 4);
+
     let calls = fx.calls();
     let rm_calls: Vec<&Vec<String>> = calls.iter().filter(|call| call[0] == "rm").collect();
     assert_eq!(rm_calls.len(), 1);
@@ -374,4 +392,26 @@ fn task_rm_only_removes_the_sandbox_and_leaves_mcp_registrations_alone() {
     // The only `sbx mcp` call in the whole run is the test's own registration.
     assert_eq!(calls.iter().filter(|call| call[0] == "mcp").count(), 1);
     assert!(Path::new(&fx.state().join("mcp").join("central-beans")).exists());
+}
+
+#[test]
+fn task_rm_preserves_sandbox_and_mcp_when_usage_export_fails() {
+    let fx = Fixture::new();
+    fx.register("central-beans", "/host/bin/beans-mcp", &[]);
+    assert!(fx
+        .task_new("demo", &["--mcp", "central-beans"])
+        .status
+        .success());
+
+    let output = fx
+        .command("herdr")
+        .env("FAKE_SSH_USAGE_FAIL", "1")
+        .args(["task", "rm", "demo"])
+        .output()
+        .expect("run herdr task rm");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("sandbox preserved because export failed"));
+    assert!(fx.calls().iter().all(|call| call[0] != "rm"));
+    assert!(fx.launcher("demo", "central-beans").exists());
+    assert!(fx.state().join("mcp/central-beans").exists());
 }

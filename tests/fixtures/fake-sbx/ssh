@@ -1,10 +1,16 @@
 #!/bin/sh
 # Fake `ssh` for herdr's task-driver tests: answers the readiness probe and the
-# model-pin read that `herdr task new` performs after `sbx create`.
-# Invoked as: ssh -o BatchMode=yes HOST REMOTE_COMMAND
-cmd="${4:-}"
+# model-pin read and metadata-only usage capture.
+# The final argument is REMOTE_COMMAND, after any SSH options and HOST.
+set -eu
+cmd=""
+for arg in "$@"; do cmd="$arg"; done
 case "$cmd" in
   *"herdr agent list"*) exit 0 ;;
   *crew/models*) printf 'claude=claude-opus-5-5,codex=gpt-6.1-sol,pi=google/gemini-3.8-flash\n' ;;
+  "python3 -c "*)
+    if [ "${FAKE_SSH_USAGE_FAIL:-0}" = 1 ]; then exit 1; fi
+    printf '%s\n' '{"schema_version":1,"scope":"sandbox_lifetime","sessions":[],"coverage":"partial","missing_roles":["orchestrator","planner","implementer","qc"],"issues":[]}'
+    ;;
 esac
 exit 0
