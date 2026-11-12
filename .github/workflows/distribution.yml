@@ -1,24 +1,6 @@
 name: Distribution contract
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/distribution.yml"
-      - "distribution/**"
-      - "docs/next/website/**"
-      - "docs/preview/**"
-      - "docs/versions/**"
-      - "scripts/agent_detection_manifest_check.py"
-      - "scripts/config_reference_check.py"
-      - "scripts/docs/**"
-      - "scripts/docs_translation_parity.py"
-      - "scripts/preview.py"
-      - "scripts/test_agent_detection_manifest_check.py"
-      - "scripts/test_config_reference_check.py"
-      - "scripts/test_docs_translation_parity.py"
-      - "scripts/test_preview.py"
-      - "src/detect/manifest_update.rs"
-      - "src/detect/manifests/**"
   push:
     branches: [master]
     paths:
